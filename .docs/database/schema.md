@@ -11,7 +11,7 @@
 
 ## 2. Table Definitions
 
-### 2.1 `users` (Feature A)
+### 2.1 `users` (Feature A & Admin Management)
 Core user account registry.
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -20,7 +20,9 @@ Core user account registry.
 | `hashed_password` | `VARCHAR(255)` | YES | NULL | Salted bcrypt hash (NULL for OAuth-only users) |
 | `full_name` | `VARCHAR(150)` | YES | NULL | Display name |
 | `avatar_url` | `TEXT` | YES | NULL | Profile image URL |
-| `is_active` | `BOOLEAN` | NO | `TRUE` | Whether account is active |
+| `role` | `VARCHAR(20)` | NO | `'user'` | User authorization role: `'user'`, `'admin'` |
+| `status` | `VARCHAR(20)` | NO | `'active'` | Account status: `'active'`, `'suspended'`, `'banned'` |
+| `is_active` | `BOOLEAN` | NO | `TRUE` | Whether account is active (syncs with status == 'active') |
 | `is_verified` | `BOOLEAN` | NO | `FALSE` | Email verification status |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Account creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last profile update timestamp |
@@ -55,7 +57,7 @@ User-provided LLM provider API keys encrypted at rest via AES-256.
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
 | `provider` | `VARCHAR(50)` | NO | — | `openai`, `gemini`, `claude` |
-| `encrypted_key` | `TEXT` | NO | — | Symmetrically encrypted API key (AES-256-GCM) |
+| `encrypted_key` | `TEXT` | NO | — | Symmetrically encrypted API key (AES-256-GCM format: `v1:<nonce>:<ciphertext>:<auth_tag>`) |
 | `key_hint` | `VARCHAR(20)` | NO | — | Masked preview (e.g. `sk-...4F8a`) |
 | `is_active` | `BOOLEAN` | NO | `TRUE` | Whether this key is currently selected |
 | `last_validated_at`| `TIMESTAMPTZ` | YES | NULL | Last successful ping check timestamp |
@@ -77,10 +79,17 @@ User-level configuration, accessibility profile, proactive assistance, and priva
 | `proactive_assistance_enabled`| `BOOLEAN` | NO | `TRUE` | Whether to suggest tips on reading slowdowns (Feature G) |
 | `proactive_sensitivity` | `VARCHAR(20)` | NO | `'medium'` | `low`, `medium`, `high` |
 | `data_protection_mode` | `BOOLEAN` | NO | `TRUE` | Feature H: Block sensitive PII/secrets outbound by default |
-| `privacy_mode_enabled` | `BOOLEAN` | NO | `FALSE` | Global toggle to prevent reading history logs |
-| `blacklisted_domains` | `JSONB` | NO | `'[]'` | List of domain patterns to ignore |
+| `privacy_mode_enabled` | `BOOLEAN` | NO | `FALSE` | Global toggle to prevent reading history logs (see Privacy Mode Matrix below) |
+| `blacklisted_domains` | `JSONB` | NO | `'[]'` | List of domain patterns to ignore (Domain Blacklist Policy) |
 | `version` | `INTEGER` | NO | `1` | Optimistic lock version for multi-device sync (Feature J) |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last settings update |
+
+#### Privacy Mode Storage Matrix (`privacy_mode_enabled = TRUE`)
+- **`reading_history`**: Strictly blocked (zero rows written; no URLs, titles, or dwell time saved).
+- **`conversations`**: Ephemeral in-session chat only (`page_url = NULL`); not persisted across browser restarts.
+- **`highlights`**: Preserved only if user explicitly clicks "Save Highlight" (explicit user intent).
+- **`quiz_records`**: Quizzes may be generated and evaluated interactively, but no score history is written to DB.
+- **Existing Historical Data**: Unaltered (enabling Privacy Mode does not delete past history).
 
 ### 2.6 `conversations` (Feature I & D)
 Chat sessions tied to specific reading contexts. Tab-isolated.
@@ -139,6 +148,7 @@ User-saved text selections and personal notes. Synchronized across devices.
 | `version` | `INTEGER` | NO | `1` | Sync version (Feature J) |
 | `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Creation timestamp |
+| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last updated timestamp (for sync cursor) |
 
 ### 2.10 `quiz_records` (Feature F — Comprehension Questions)
 Stores generated quizzes, user responses, and score history.
@@ -161,5 +171,9 @@ User ratings and error reports on AI responses.
 | `message_id` | `UUID` | NO | — | FK -> `messages.id` (ON DELETE CASCADE) |
 | `rating` | `VARCHAR(10)` | NO | — | `helpful` or `unhelpful` |
 | `report_reason` | `VARCHAR(50)` | YES | NULL | `inaccurate`, `hallucination`, `harmful`, `other` |
+| `comment` | `TEXT` | YES | NULL | Optional user explanation |
+| `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Feedback timestamp |
+| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last updated timestamp |
+*(Unique Constraint: `[user_id, message_id]`. Duplicate submissions atomically update the existing record).*
 | `comment` | `TEXT` | YES | NULL | Optional user explanation |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Feedback timestamp |

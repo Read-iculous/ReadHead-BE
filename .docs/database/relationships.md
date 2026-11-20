@@ -22,6 +22,8 @@ erDiagram
         string email UK
         string hashed_password
         string full_name
+        string role
+        string status
         boolean is_active
         datetime created_at
     }
@@ -82,6 +84,7 @@ erDiagram
         text content
         text selected_context
         string provider_used
+        string model_used
         boolean is_grounded
         boolean uncertainty_flag
         text grounding_notes
@@ -94,6 +97,7 @@ erDiagram
         text page_url
         string page_title
         text cached_summary
+        integer reading_time_seconds
         boolean is_bookmarked
         datetime visited_at
     }
@@ -108,6 +112,7 @@ erDiagram
         integer version
         boolean is_deleted
         datetime created_at
+        datetime updated_at
     }
 
     quiz_records {
@@ -128,6 +133,7 @@ erDiagram
         string report_reason
         text comment
         datetime created_at
+        datetime updated_at
     }
 ```
 
@@ -143,3 +149,4 @@ erDiagram
   - `conversations(user_id, updated_at DESC)`: Index for recent conversation lookups.
   - `messages(conversation_id, created_at ASC)`: Chronological retrieval.
   - `quiz_records(user_id, created_at DESC)`: Historical quiz reviews.
+  - `ai_feedback(user_id, message_id)`: Unique index enforcing one active rating per user per message.

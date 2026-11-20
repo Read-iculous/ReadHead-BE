@@ -9,6 +9,7 @@ All environment variables are loaded and validated at startup using Pydantic Set
 | `DEBUG` | No | `true` | Enables verbose logging and exception stack traces |
 | `PORT` | No | `8000` | Port for the Uvicorn server |
 | `DATABASE_URL` | **Yes** | — | Async PostgreSQL connection string: `postgresql+asyncpg://user:pass@localhost:5432/readhead` |
+| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection URL for rate limiting, token blacklist & cache |
 | `JWT_SECRET_KEY` | **Yes** | — | High-entropy secret key used to sign Access and Refresh JWTs |
 | `JWT_ALGORITHM` | No | `HS256` | JWT signing algorithm |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `60` | Lifespan of Access Tokens (default: 1 hour) |
@@ -26,8 +27,9 @@ ENVIRONMENT=development
 DEBUG=true
 PORT=8000
 
-# Database
+# Database & Cache
 DATABASE_URL=postgresql+asyncpg://readhead_user:readhead_pass@localhost:5432/readhead_db
+REDIS_URL=redis://localhost:6379/0
 
 # Security & JWT
 JWT_SECRET_KEY=change_this_to_a_super_secret_high_entropy_random_string_32_chars_min
@@ -46,5 +48,5 @@ GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
 
 # CORS
-CORS_ORIGINS=chrome-extension://*,http://localhost:3000
+CORS_ORIGINS=chrome-extension://*,http://localhost:3000,http://localhost:5173
 ```

@@ -9,6 +9,7 @@ app/
 │   ├── security.py            # Password hashing (bcrypt) & AES-256 key encryption
 │   ├── auth.py                # JWT creation, decode & FastAPI authentication dependencies
 │   ├── database.py            # Async engine, sessionmaker & Base declarative class
+│   ├── redis.py               # Async Redis connection pool & rate limiter configuration
 │   ├── exceptions.py          # Standard domain exceptions and HTTP error handlers
 │   ├── privacy/               # Sensitive Data & Privacy Subsystem (Feature H)
 │   │   ├── pii_detector.py    # Regex & heuristic detection for credentials, keys, PII
@@ -39,7 +40,8 @@ app/
 │   ├── reading.py             # History, highlights, bookmarks schemas
 │   ├── quiz.py                # Quiz questions, answer submission, score schemas
 │   ├── sync.py                # Multi-device sync push/pull & conflict schemas (Feature J)
-│   └── feedback.py            # Response rating & inaccuracy report schemas
+│   ├── feedback.py            # Response rating & inaccuracy report schemas
+│   └── admin.py               # Telemetry metrics, user status update & admin feedback schemas
 ├── services/                  # Business Logic Layer
 │   ├── auth_service.py        # Registration, login, session token lifecycle
 │   ├── user_service.py        # Profile & accessibility settings operations
@@ -50,17 +52,20 @@ app/
 │   ├── reading_service.py     # History, bookmarks, highlights & privacy enforcement
 │   ├── quiz_service.py        # Comprehension quiz generation & score evaluation
 │   ├── sync_service.py        # Incremental sync & conflict resolution engine
-│   └── feedback_service.py    # User ratings & reporting management
+│   ├── feedback_service.py    # User ratings & reporting management
+│   └── admin_service.py       # Platform telemetry aggregation & user moderation
 └── routers/                   # API Route Handlers
     ├── router.py              # Root router aggregating sub-routers
     ├── health.py              # /api/v1/health (Feature L)
     ├── auth.py                # /api/v1/auth (Feature A)
     ├── users.py               # /api/v1/users (Features A & B)
     ├── api_keys.py            # /api/v1/api-keys (Feature C)
-    ├── ai.py                  # /api/v1/ai (Features E, F, G, H)
+    ├── ai.py                  # /api/v1/ai (Features E, G, H)
+    ├── quiz.py                # /api/v1/quiz (Feature F)
     ├── conversations.py       # /api/v1/conversations (Feature I)
     ├── reading.py             # /api/v1/reading (Feature I)
-    └── sync.py                # /api/v1/sync (Feature J)
+    ├── sync.py                # /api/v1/sync (Feature J)
+    └── admin.py               # /api/v1/admin (Web Management Portal Ops)
 ```
 
 ---

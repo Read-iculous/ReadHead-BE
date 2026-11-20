@@ -13,6 +13,10 @@ sqlalchemy>=2.0.28,<3.0.0
 asyncpg>=0.29.0,<1.0.0
 alembic>=1.13.1,<2.0.0
 
+# In-Memory Cache & Rate Limiting
+redis>=5.0.3,<6.0.0
+slowapi>=0.1.9,<1.0.0
+
 # Security, Cryptography & Auth
 passlib[bcrypt]>=1.7.4
 python-jose[cryptography]>=3.3.0

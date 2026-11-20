@@ -31,6 +31,5 @@ alembic current
 
 | Revision ID | Description | Impacted Tables | Status |
 |---|---|---|---|
-| `0001_initial_schema` | Core tables: users, oauth, keys, settings, conversations, history | All initial tables | Planned |
-| `0002_add_domain_blacklist` | Add JSONB index and domain filtering support | `user_settings` | Planned |
-| `0003_add_comprehension_quiz` | Add quiz metadata and score tracking | `conversations`, `messages` | Planned |
+| `0001_initial_schema` | Full initial schema across all 11 core tables (`users`, `oauth_accounts`, `refresh_tokens`, `user_api_keys`, `user_settings`, `conversations`, `messages`, `reading_history`, `highlights`, `quiz_records`, `ai_feedback`) including `role` and `status` columns. | All 11 tables | Planned |
+| `0002_add_domain_blacklist_gin_idx` | Add PostgreSQL GIN index on `user_settings.blacklisted_domains` for high-speed domain matching. | `user_settings` | Planned |

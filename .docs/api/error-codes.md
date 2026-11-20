@@ -23,6 +23,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `401` | `TOKEN_INVALID` | Malformed or improperly signed JWT |
 | `401` | `REFRESH_TOKEN_EXPIRED` | Refresh token expired; user must log in again |
 | `401` | `REFRESH_TOKEN_REVOKED` | Refresh token was explicitly logged out or invalidated |
+| `401` | `USER_SUSPENDED` | Account has been suspended or banned by administrator |
 | `403` | `ACCOUNT_INACTIVE` | Account has been deactivated |
 | `403` | `FORBIDDEN_RESOURCE` | User does not own the requested resource |
 
@@ -32,7 +33,6 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `422` | `VALIDATION_ERROR` | Pydantic schema validation failure |
 | `400` | `INVALID_JSON` | Malformed JSON request body |
 | `409` | `EMAIL_ALREADY_EXISTS` | Registration email already registered |
-| `409` | `PROVIDER_KEY_ALREADY_EXISTS`| Key for this provider already registered |
 
 ### 2.3 Not Found (`404`)
 | HTTP Status | Error Code | Description |
@@ -40,6 +40,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `404` | `USER_NOT_FOUND` | User entity not found |
 | `404` | `API_KEY_NOT_FOUND` | No API key found for requested provider |
 | `404` | `CONVERSATION_NOT_FOUND` | Conversation session ID not found |
+| `404` | `MESSAGE_NOT_FOUND` | Message ID not found |
 | `404` | `HIGHLIGHT_NOT_FOUND` | Highlight ID not found |
 | `404` | `QUIZ_NOT_FOUND` | Quiz record ID not found |
 
@@ -67,9 +68,16 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `502` | `UPSTREAM_QUOTA_EXCEEDED` | User's provider quota/credit has been exhausted |
 | `504` | `UPSTREAM_AI_TIMEOUT` | Provider took too long to begin streaming |
 
-### 2.7 Server & System Errors (`500` — Feature L)
+### 2.7 Server & System Errors (`500`, `503` — Feature L)
 | HTTP Status | Error Code | Description |
 |---|---|---|
 | `500` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 | `500` | `DATABASE_ERROR` | Database connection or execution failure |
 | `500` | `ENCRYPTION_ERROR` | Key decryption failure (invalid master key) |
+| `503` | `DEPENDENCY_UNHEALTHY` | Core dependency (Database or Redis) connection failure |
+
+### 2.8 Rate Limiting & Concurrency (`429` — Platform Ops & Guardrails)
+| HTTP Status | Error Code | Description |
+|---|---|---|
+| `429` | `RATE_LIMIT_EXCEEDED` | Request rate limit exceeded for IP or user |
+| `429` | `STREAM_CONCURRENCY_EXCEEDED` | Maximum active concurrent SSE streams exceeded (max 2 active streams per user) |
