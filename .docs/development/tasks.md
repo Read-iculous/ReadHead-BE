@@ -41,6 +41,9 @@ Phase 8: Multi-Device Sync & Concurrency (Feature J)
 
 Phase 9: Quality Assurance & Integration (NFRs)
   └── [BE-17] End-to-End Integration Test Suite & Coverage Baseline
+
+Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
+  └── [BE-18] Admin Portal API, Telemetry Engine & Redis Rate Limiter
 ```
 
 ---
@@ -86,7 +89,7 @@ Phase 9: Quality Assurance & Integration (NFRs)
   - All foreign keys, cascade delete policies, and indexes match `.docs/database/relationships.md`.
 - **Verification / Screenshot**:
   - Command: `alembic current` shows head revision.
-  - Screenshot: PostgreSQL GUI (pgAdmin / DBeaver / terminal `\dt`) showing all 10 tables created with correct foreign key constraints.
+  - Screenshot: PostgreSQL GUI (pgAdmin / DBeaver / terminal `\dt`) showing all 11 tables created with correct foreign key constraints.
 
 ---
 
@@ -100,13 +103,15 @@ Phase 9: Quality Assurance & Integration (NFRs)
   - `app/core/auth.py`: Token generation (`create_access_token`, `create_refresh_token`), verification, and `get_current_user` dependency.
   - `app/models/refresh_token.py`: Store active refresh tokens with revocation flags and expiration.
   - `app/schemas/auth.py`: Pydantic schemas for `UserRegisterRequest`, `UserLoginRequest`, `TokenResponse`, and `TokenRefreshRequest`.
-  - `app/services/auth_service.py`: Business logic for credential checking, duplicate email validation, and token rotation.
+  - `app/services/auth_service.py`: Business logic for credential checking, duplicate email validation, token rotation, and 30-second Redis concurrency grace period.
   - `app/routers/auth.py`: Endpoints `POST /register`, `POST /login`, `POST /refresh`, `POST /logout`.
 - **Acceptance Criteria**:
   - `POST /register` with valid data returns `201 Created` and initial tokens.
   - Duplicate registration returns `409 EMAIL_ALREADY_EXISTS`.
   - Invalid login returns `401 INVALID_CREDENTIALS`.
-  - `POST /refresh` with valid refresh token issues a new access token; revoked token returns `401 REFRESH_TOKEN_REVOKED`.
+  - `POST /refresh` with valid refresh token rotates and issues a new access + refresh token pair.
+  - Concurrent multi-tab refresh requests presenting the same old token within 30 seconds are safely served the new token pair without revocation errors.
+  - Revoked or reused tokens outside the grace period return `401 REFRESH_TOKEN_REVOKED` and trigger immediate session invalidation.
   - `POST /logout` marks the refresh token as revoked.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_auth_api.py -v`
@@ -143,6 +148,7 @@ Phase 9: Quality Assurance & Integration (NFRs)
   - `GET /api/v1/users/me` returns current user profile without password or secret data.
   - `DELETE /api/v1/users/me` requires explicit confirmation string (`DELETE_ACCOUNT`) and valid password (for non-OAuth accounts).
   - Deletion cascades and completely removes all associated API keys, conversations, history, highlights, and settings.
+  - Writes `revoked_users:{user_id}` to Redis with TTL=3600s, instantly rejecting any in-flight active access tokens across all devices.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_user_lifecycle.py -v`
   - Screenshot: Response from `DELETE /api/v1/users/me` returning `204 No Content` and verifying database record removal.
@@ -176,14 +182,16 @@ Phase 9: Quality Assurance & Integration (NFRs)
 - **Plan & Codebase**:
   - `app/core/security.py`: Add `encrypt_secret()` and `decrypt_secret()` using `ENCRYPTION_MASTER_KEY`.
   - `app/schemas/api_key.py`: `ApiKeyCreateRequest`, `ApiKeyResponse` (with masked `key_hint`), `KeyValidationResponse`.
-  - `app/services/api_key_service.py`: Add methods to store, retrieve, delete, and test keys. Enforce max 1 active key per provider.
-  - `app/routers/api_keys.py`: Endpoints `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{provider}`, `POST /api/keys/{provider}/validate`.
+  - `app/services/api_key_service.py`: Add methods to store, retrieve, delete, and test keys. Enforce UPSERT behavior (atomic replace upon successful ping test; preserves old key if validation fails).
+  - `app/cli/rotate_keys.py`: CLI maintenance utility (`python -m app.cli.rotate_keys --old-key ... --new-key ...`) to re-encrypt stored keys when rotating master secrets.
+  - `app/routers/api_keys.py`: Endpoints `GET /api/v1/api-keys`, `POST /api/v1/api-keys`, `DELETE /api/v1/api-keys/{provider}`, `POST /api/v1/api-keys/{provider}/validate`.
 - **Acceptance Criteria**:
-  - Plaintext key is encrypted before writing to PostgreSQL; database inspect shows ciphertext.
+  - Plaintext key is encrypted before writing to PostgreSQL (format: `v1:<nonce>:<ciphertext>:<tag>`); database inspect shows ciphertext.
   - `GET /api-keys` returns only masked previews (`sk-...4aF9`), never the decrypted key.
   - `POST /api-keys/{provider}/validate` performs a lightweight ping to the external provider:
     - If valid: returns `200 OK` with `valid: true`.
     - If invalid: returns `400 KEY_VALIDATION_FAILED` and rejects activation.
+  - Key rotation script successfully upgrades existing `v1` ciphers to `v2` without downtime.
   - Logs never contain plaintext keys (`FR-KEY-07`, `FR-OPS-03`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/unit/test_security_vault.py tests/integration/test_api_keys_api.py -v`
@@ -214,18 +222,20 @@ Phase 9: Quality Assurance & Integration (NFRs)
 ---
 
 ### [BE-09] Real-Time SSE AI Streaming Endpoint
-- **Feature Reference**: Feature E (`FR-AI-01~12`), `ADR-002`, `ADR-009`
-- **Description**: Implement the central `/api/v1/ai/stream` Server-Sent Events endpoint handling Explain, Summarize, Translate, Simplify (Accessibility), and Multi-turn Chat.
+- **Feature Reference**: Feature E (`FR-AI-01~12`), `ADR-002`, `ADR-009`, `ADR-011`
+- **Description**: Implement the central `/api/v1/ai/stream` Server-Sent Events endpoint handling Explain, Summarize, Translate, Simplify (Accessibility), and Multi-turn Chat. Enforce prompt injection fencing, max 2 concurrent SSE streams per user, and zero-binary PDF text ingestion.
 - **Plan & Codebase**:
-  - `app/schemas/ai.py`: `AiStreamRequest` (with task enum: `explain`, `summarize`, `translate`, `simplify`, `chat`, `quiz`).
-  - `app/services/ai_service.py`: Orchestrate user key decryption, conversation history injection, prompt construction, and async chunk generation.
-  - `app/routers/ai.py`: Mount `POST /api/v1/ai/stream` using FastAPI's `StreamingResponse(media_type="text/event-stream")`.
+  - `app/schemas/ai.py`: `AiStreamRequest` (with task enum: `explain`, `summarize`, `translate`, `simplify`, `chat`; payload accepts `selected_text`, `page_content`, `content_type`, `user_prompt`, `bypass_protection`).
+  - `app/services/ai_service.py`: Orchestrate user key decryption, conversation history injection, prompt construction with XML fencing (`<untrusted_web_context>`, `<user_selected_text>`), and async chunk generation.
+  - `app/routers/ai.py`: Mount `POST /api/v1/ai/stream` using FastAPI's `StreamingResponse(media_type="text/event-stream")`. Check and enforce max 2 concurrent active SSE streams via Redis `active_streams:{user_id}` (`429 STREAM_CONCURRENCY_EXCEEDED`).
   - Implement client disconnect detection (`asyncio.CancelledError`) to abort upstream streams gracefully (`ISSUE-001`).
   - Enforce rule against silent automated AI retries (`ADR-009`).
 - **Acceptance Criteria**:
-  - Returns `text/event-stream` with events `start`, `delta`, `metadata` (grounding info), and `done`.
+  - Returns `text/event-stream` with standard events `start`, `token`, `citation`, `done`, and `error`.
   - If user has no active key for the provider, returns `400 NO_ACTIVE_API_KEY` before starting stream.
-  - If upstream provider fails or runs out of quota, streams an error event and saves message draft locally without crashes.
+  - If user already has 2 active streams, rejects 3rd request with `429 STREAM_CONCURRENCY_EXCEEDED`.
+  - If upstream provider fails or runs out of quota, streams `event: error` and aborts stream without `event: done`.
+  - Supports `content_type: "pdf_text"` with client-extracted plain text (max 100KB); rejects raw binary files.
 - **Verification / Screenshot**:
   - Command: `curl -N -X POST http://localhost:8000/api/v1/ai/stream -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"task": "explain", "selected_text": "Photosynthesis"}'`
   - Screenshot: Terminal or Postman showing continuous event stream output chunk by chunk.
@@ -312,11 +322,12 @@ Phase 9: Quality Assurance & Integration (NFRs)
 - **Plan & Codebase**:
   - `app/schemas/reading.py`: `ReadingHistoryCreate`, `ReadingHistoryResponse`, `HighlightCreate`, `HighlightResponse`.
   - `app/services/reading_service.py`: Record history (bypassed if privacy mode or blacklisted domain), save highlights, clear history.
-  - `app/routers/reading.py`: `GET/POST /reading/history`, `DELETE /reading/history`, `GET/POST /reading/highlights`.
+  - `app/routers/reading.py`: `POST /api/v1/reading/history`, `GET /api/v1/reading/history`, `DELETE /api/v1/reading/history`, `POST /api/v1/reading/highlights`, `GET /api/v1/reading/highlights`.
 - **Acceptance Criteria**:
-  - If `privacy_mode_enabled: true` or URL is blacklisted, `POST /reading/history` returns `200 OK` with null data without saving to DB.
+  - If `privacy_mode_enabled: true` or URL is blacklisted, `POST /api/v1/reading/history` returns `200 OK` with null data without saving to DB.
+  - `GET /api/v1/reading/history` returns paginated reading logs with dwell time and cached summaries.
   - Highlights are retrievable by `page_url` filter.
-  - `DELETE /reading/history` clears browsing logs while preserving account credentials and API keys (`FR-HIS-05`, `FR-HIS-07`).
+  - `DELETE /api/v1/reading/history` clears browsing logs while preserving account credentials and API keys (`FR-HIS-05`, `FR-HIS-07`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_reading_history_api.py -v`
   - Screenshot: Response of `DELETE /api/v1/reading/history` returning `204 No Content` and verifying database rows wiped.
@@ -325,10 +336,10 @@ Phase 9: Quality Assurance & Integration (NFRs)
 
 ### [BE-15] User Feedback & Accuracy Reporting
 - **Feature Reference**: Feature E (`BR-15`, `BG-08`)
-- **Description**: Allow users to rate AI responses (helpful / unhelpful) and report inaccuracies or hallucinations to track AI answer quality.
+- **Description**: Allow users to rate AI responses (helpful / unhelpful) and report inaccuracies or hallucinations to track AI answer quality. Enforce message ownership and duplicate UPSERT.
 - **Plan & Codebase**:
   - `app/schemas/feedback.py`: `AiFeedbackCreateRequest` (`message_id`, `rating`, `report_reason`, `comment`).
-  - `app/services/feedback_service.py`: Record feedback linked to user and message.
+  - `app/services/feedback_service.py`: Record or atomically update feedback linked to user and message. Verify message belongs to user's conversation (`403 FORBIDDEN_RESOURCE` if not).
   - `app/routers/ai.py`: Mount `POST /api/v1/ai/feedback`.
 - **Acceptance Criteria**:
   - Authenticated user can submit feedback for an existing message.
@@ -350,7 +361,7 @@ Phase 9: Quality Assurance & Integration (NFRs)
   - `app/services/sync_service.py`: Compare entity `version` and `updated_at`. If incoming mutation has a base version lower than current server version, raise a conflict.
   - `app/routers/sync.py`: Mount `POST /api/v1/sync/pull` and `POST /api/v1/sync/push`.
 - **Acceptance Criteria**:
-  - `POST /sync/pull` returns only records modified after `last_synced_at`.
+  - `POST /sync/pull` returns modified records paginated by `cursor` and `limit` (max 100), along with `next_cursor` and `has_more`.
   - `POST /sync/push` applies mutations atomically and increments entity version numbers.
   - In a conflict situation (stale version submitted), server returns `409 SYNC_CONFLICT` with both versions, strictly preventing silent data loss (`FR-SYN-05`).
   - In-flight unsent drafts are excluded from synchronization (`FR-SYN-07`).
@@ -376,3 +387,24 @@ Phase 9: Quality Assurance & Integration (NFRs)
 - **Verification / Screenshot**:
   - Command: `pytest -v --cov=app --cov-report=term-missing`
   - Screenshot: Terminal output showing 100% passed test suite and code coverage summary table.
+
+---
+
+## Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
+
+### [BE-18] Admin Portal API, Telemetry Engine & Redis Rate Limiter
+- **Feature Reference**: Web Management Portal, Feature L (`FR-OPS-01~05`)
+- **Description**: Implement platform telemetry aggregation, user management (suspend/ban accounts), feedback browsing, and Redis-backed IP/User rate limiting (`slowapi`).
+- **Plan & Codebase**:
+  - `app/core/limiter.py`: Configure Redis-backed `slowapi.Limiter` to protect AI endpoints from burst abuse.
+  - `app/schemas/admin.py`: `TelemetryResponse`, `AdminUserListResponse`, `UserStatusUpdateRequest`, `AdminFeedbackResponse`.
+  - `app/services/admin_service.py`: Aggregate request volume, upstream model breakdown (without reading user prompt text), update account statuses, list feedback logs.
+  - `app/routers/admin.py`: Mount `GET /api/v1/admin/telemetry`, `GET /api/v1/admin/users`, `PATCH /api/v1/admin/users/{id}/status`, `GET /api/v1/admin/feedback` protected by `require_admin` dependency.
+- **Acceptance Criteria**:
+  - All `/api/v1/admin/*` endpoints strictly reject non-admin users with `403 FORBIDDEN_RESOURCE`.
+  - Telemetry numbers are aggregated purely from counters and logs with **zero plaintext user reading materials exposed** (strict privacy isolation guarantee).
+  - Banning/suspending a user immediately sets `revoked_users:{user_id}` in Redis (TTL=3600s), revoking all active sessions and blocking in-flight access tokens within 1ms.
+  - Excessive requests hit rate limits with standard `429 Too Many Requests` headers; SSE endpoint limits active concurrency to max 2 streams.
+- **Verification / Screenshot**:
+  - Test: `pytest tests/integration/test_admin_portal.py -v`
+  - Screenshot: Swagger/Postman output showing `GET /api/v1/admin/telemetry` returning telemetry JSON and `PATCH /api/v1/admin/users/{id}/status` successfully banning an account.

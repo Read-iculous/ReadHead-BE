@@ -7,6 +7,7 @@
 | **Framework** | FastAPI | 0.110+ | High-performance async web framework |
 | **ASGI Server** | Uvicorn | Standard (uvloop) | Production-ready ASGI server |
 | **Database** | PostgreSQL | 15+ / 16+ | Primary ACID-compliant relational data store |
+| **In-Memory Cache & Limiter** | Redis | 7.0+ | Fast in-memory cache, rate limiting, and token revocation |
 | **ORM** | SQLAlchemy | 2.0+ (asyncio mode) | Object-relational mapping with async query execution |
 | **DB Driver** | asyncpg | 0.29+ | High-performance asynchronous PostgreSQL driver |
 | **Migrations** | Alembic | 1.13+ | Schema version control & migration management |

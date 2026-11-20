@@ -44,17 +44,23 @@ Extension Client                                  ReadHead-BE               OAut
        |<- 200 OK (access_token, refresh_token) --------|
 ```
 
-### 2.3 Token Refresh Flow
+### 2.3 Token Refresh Flow & Rotation
 When an API request returns `401 Unauthorized` with error code `TOKEN_EXPIRED`:
 ```
 Extension Client                                  ReadHead-BE
        |                                                |
        |----- POST /api/v1/auth/refresh (refresh_token) >|
-       |                                                |-- Verify token signature
-       |                                                |-- Check DB if token revoked
-       |                                                |-- Issue new access_token
+       |                                                |-- Verify token signature & DB revocation
+       |                                                |-- Rotate: issue new access & refresh tokens
+       |                                                |-- Cache rotated pair in Redis (30s TTL)
        |<- 200 OK (new access_token, refresh_token) ----|
 ```
+
+#### 2.3.1 Multi-Tab Concurrency Grace Period (30 Seconds)
+When multiple browser tabs make concurrent refresh requests upon access token expiry:
+1. The first request successfully rotates the token pair and caches the mapping `hash(old_refresh_token) -> new_token_pair` in Redis with a **30-second TTL**.
+2. Subsequent concurrent requests arriving within 30 seconds presenting the same old token are served the newly generated token pair without error.
+3. Requests presenting an expired/rotated token after 30 seconds trigger **Token Reuse Detection**, immediately invalidating all refresh tokens for that user account.
 
 ### 2.4 Logout & Session Revocation
 ```
@@ -64,3 +70,8 @@ Extension Client                                  ReadHead-BE
        |                                                |-- Mark refresh token as revoked
        |<- 204 No Content ------------------------------|
 ```
+
+### 2.5 Multi-Account Isolation & Storage Purge (`FR-ACC-04`)
+To prevent cross-account data leakage on shared browser environments:
+- Upon receiving a successful logout response, the client must purge all credentials, drafts (`draft_*`), and cached DOM extracts from `chrome.storage.local`.
+- Background service worker broadcasts `ACTION_PURGE_SESSION` across all active extension frames, redirecting any open Side Panels to `/login`.

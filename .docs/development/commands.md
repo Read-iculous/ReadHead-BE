@@ -69,3 +69,9 @@ ruff check app/ tests/
 # Run static type checking with Mypy
 mypy app/
 ```
+
+## 5. Security & Maintenance Utilities
+```bash
+# Rotate master encryption key for stored BYOK user keys (upgrades v1 -> v2)
+python -m app.cli.rotate_keys --old-key <old_master_key> --new-key <new_master_key>
+```

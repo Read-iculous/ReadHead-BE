@@ -33,11 +33,12 @@
                     |                                       |
                     v                                       v
      +------------------------------+       +------------------------------+
-     |     PostgreSQL Database      |       |    External AI Providers     |
+     |     PostgreSQL + Redis       |       |    External AI Providers     |
      |  - Users & Credentials       |       |  - OpenAI (GPT-4o, etc.)     |
      |  - Encrypted Keys (AES-256)  |       |  - Google Gemini             |
      |  - Conversations & Messages  |       |  - Anthropic Claude          |
      |  - History, Bookmarks, Prefs |       |  (Called via User's Key)     |
+     |  - Redis: Rate Limit & Cache |       |                              |
      +------------------------------+       +------------------------------+
 ```
 

@@ -6,7 +6,7 @@
 - **Decision**: Route all AI calls through the ReadHead backend while having users supply their own API keys (BYOK).
 - **Consequences**:
   - *Pros*: Centralized prompt engineering, privacy filters, token usage diagnostics, audit trails, and multi-turn history persistence without bloating the extension.
-  - *Cons*: Backend handles streaming traffic and must guarantee zero-knowledge security for stored keys.
+  - *Cons*: Backend handles streaming traffic and must guarantee robust security (Envelope Encryption at rest, ephemeral in-memory decryption) for stored keys.
 
 ---
 
@@ -20,12 +20,12 @@
 
 ---
 
-## ADR-003: Symmetric AES-256 Encryption for User API Keys
+## ADR-003: Symmetric AES-256-GCM Encryption for User API Keys
 - **Status**: Accepted
 - **Context**: The backend needs to decrypt user API keys to make upstream calls on their behalf, so one-way hashing (like bcrypt) cannot be used.
-- **Decision**: Store API keys encrypted using AES-256-GCM with a secret master key stored strictly in environment variables (`ENCRYPTION_MASTER_KEY`).
+- **Decision**: Store API keys encrypted using **AES-256-GCM** (Authenticated Encryption with Associated Data). Ciphertext is stored as `v1:<base64_nonce>:<base64_ciphertext>:<base64_auth_tag>` with a secret master key stored strictly in environment variables (`ENCRYPTION_MASTER_KEY`). Fernet and CBC modes are explicitly eliminated.
 - **Consequences**:
-  - *Pros*: Strong cryptographic security at rest. If the database leaks, keys remain unreadable without the environment master key.
+  - *Pros*: Strong cryptographic security at rest with authentication tag verification preventing ciphertext tampering. Key version prefix (`v1:`) facilitates future zero-downtime key rotation.
   - *Cons*: Key rotation requires an operational script to re-encrypt existing keys.
 
 ---
@@ -33,9 +33,9 @@
 ## ADR-004: Dual JWT Token Architecture (Access + Refresh Tokens)
 - **Status**: Accepted
 - **Context**: Extension users expect long-lived sessions without having to re-authenticate daily, while security requires short-lived access tokens.
-- **Decision**: Issue short-lived Access Tokens (30-60 minutes) and longer-lived Refresh Tokens (14-30 days) with database-backed token revocation / session tracking.
+- **Decision**: Issue short-lived Access Tokens (60 minutes) and longer-lived Refresh Tokens (30 days) with token rotation on refresh and a 30-second concurrency grace period. Database-backed token tracking allows immediate session revocation.
 - **Consequences**:
-  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens can be invalidated upon logout or suspicious activity.
+  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens are rotated and can be invalidated upon logout or suspicious activity.
   - *Cons*: Extension needs token-refresh interceptors to handle 401s seamlessly.
 
 ---
@@ -52,10 +52,10 @@
 ## ADR-006: Pre-flight Sensitive Content Inspection (Feature H)
 - **Status**: Accepted
 - **Context**: BRS and SRS require that sensitive content (credentials, PII, financial data) must not be transmitted to external AI providers without user consent.
-- **Decision**: Implement a pre-flight privacy check on the backend (and mirrored on the client) that scans outbound text against regex and heuristic patterns. By default, transmission is blocked with a 400 `SENSITIVE_DATA_DETECTED` response containing redacted excerpts. Users can review and explicitly override with `bypass_protection: true`.
+- **Decision**: Implement a pre-flight privacy check that scans **100% of the outbound text payload** (`selected_text`, `page_content`, `user_prompt`) against high-speed regex and heuristic patterns (< 5ms). By default, transmission is blocked with a 400 `SENSITIVE_DATA_DETECTED` response containing redacted excerpts. Users can review and explicitly override with `bypass_protection: true`.
 - **Consequences**:
-  - *Pros*: Guarantees data privacy compliance before outbound external API calls occur.
-  - *Cons*: Slight latency overhead for regex scanning on large page extracts (mitigated by bounded token window inspection).
+  - *Pros*: Zero uninspected data transmitted to external LLMs; strict compliance with privacy mandates.
+  - *Cons*: Regex rules must be maintained and tuned to avoid excessive false positives.
 
 ---
 
@@ -86,3 +86,26 @@
 - **Consequences**:
   - *Pros*: Protects user from unexpected LLM billing, duplicate actions, and privacy violations.
   - *Cons*: Requires user to click "Retry" after fixing connection or keys.
+
+---
+
+## ADR-010: Real-Time Session Invalidation & Token Revocation via Redis
+- **Status**: Accepted
+- **Context**: Access Tokens have a 60-minute lifetime. When an admin bans an account or a user performs account deletion, waiting up to 60 minutes for JWT expiration creates an unauthorized access vulnerability.
+- **Decision**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check on every authenticated request and rejects revoked users immediately with `401 USER_SUSPENDED` or `401 UNAUTHORIZED`.
+- **Consequences**:
+  - *Pros*: Instantaneous cross-device session termination upon administrative action or account deletion.
+  - *Cons*: Introduces sub-millisecond Redis query to authenticated request pipeline.
+
+---
+
+## ADR-011: SSE Concurrency Limits, Client-Side PDF Parsing & Untrusted Context Fencing
+- **Status**: Accepted
+- **Context**: Unbounded long-lived SSE connections can exhaust backend workers. PDF document uploads can balloon server disk/RAM. Untrusted web page text can harbor prompt injection attacks against LLMs.
+- **Decision**:
+  1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (`slowapi`) apply strictly to the initial HTTP handshake.
+  2. **Zero-Binary PDF Handling**: Browser extension extracts clean text locally using bundled Mozilla `pdf.js` (max 100 KB text extract); zero raw PDF binaries are uploaded to the backend.
+  3. **Prompt Injection Fencing**: Backend wraps web-derived contexts in XML delimiter tags (`<untrusted_web_context>` and `<user_selected_text>`) with immutable system prompt instructions commanding the LLM to treat inner text purely as passive reference data.
+- **Consequences**:
+  - *Pros*: Protects server capacity, honors zero-document retention privacy, and hardens LLM against adversarial page injections.
+  - *Cons*: Extension must bundle `pdf.js` worker and enforce 100 KB text truncation.

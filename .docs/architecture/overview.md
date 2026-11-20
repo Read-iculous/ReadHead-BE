@@ -34,6 +34,6 @@ ReadHead-BE is built using a **Modular Layered Architecture** with an **Asynchro
 ## 2. Architectural Principles
 1. **Thin Routers, Rich Services**: Routers do not perform queries, encrypt keys, or construct prompts. They only translate HTTP into service calls and service results into HTTP responses.
 2. **Provider Agnostic Core**: Core business logic interacts exclusively with an abstract `BaseAIProvider` protocol, never directly with specific SDKs.
-3. **Zero Plaintext Key Storage**: User API keys are symmetrically encrypted at rest via AES-256 (GCM/CBC mode) using an environment-level master secret.
+3. **Zero Plaintext Key Storage**: User API keys are symmetrically encrypted at rest via AES-256-GCM using an environment-level master secret. Plaintext keys only exist ephemerally in worker memory during upstream LLM calls.
 4. **Non-blocking Streaming**: All LLM interactions yield chunks asynchronously using Python's `AsyncGenerator[str, None]` to prevent thread exhaustion during long streaming responses.
 5. **Strict Boundary Validation**: Inbound payloads are strictly validated using Pydantic V2 schemas before touching any internal service.
