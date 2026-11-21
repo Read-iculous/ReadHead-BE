@@ -72,6 +72,12 @@ mypy app/
 
 ## 5. Security & Maintenance Utilities
 ```bash
+# Bootstrap the initial Super Admin account
+python -m app.cli.create_admin --email admin@readhead.io --password "SecureAdminPassword123!"
+
 # Rotate master encryption key for stored BYOK user keys (upgrades v1 -> v2)
-python -m app.cli.rotate_keys --old-key <old_master_key> --new-key <new_master_key>
+python -m app.cli.rotate_keys --old-version v1 --new-version v2
+
+# Purge soft-deleted tombstones older than 30 days (cascades to messages & feedback)
+python -m app.cli.purge_tombstones --days 30
 ```

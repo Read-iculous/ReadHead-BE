@@ -15,8 +15,8 @@ Base URL: `/api/v1`
 
 ## 1. System Health & Diagnostics (`/api/v1/health` — Feature L)
 
-### 1.1 GET `/api/v1/health`
-- **Description**: Public health probe for uptime, database connectivity, and Redis cache status.
+### 1.1 GET `/api/v1/health` (Readiness Probe)
+- **Description**: Container readiness probe checking database connectivity and Redis cache status (enforces 1.5s timeout on dependency pings to prevent cascading pod kill loops).
 - **Auth**: Public
 - **Response**: `200 OK` (when all dependencies healthy) or `503 Service Unavailable` (when DB or Redis down)
   ```json
@@ -45,6 +45,11 @@ Base URL: `/api/v1`
     "timestamp": "2026-11-21T00:00:00Z"
   }
   ```
+
+### 1.2 GET `/api/v1/health/live` (Liveness Probe)
+- **Description**: Lightweight container liveness probe verifying the FastAPI server process is responsive without touching DB or Redis.
+- **Auth**: Public
+- **Response**: `200 OK` `{"status": "alive"}`
 
 ---
 
@@ -92,7 +97,7 @@ Base URL: `/api/v1`
   ```
 
 ### 2.3 POST `/api/v1/auth/oauth/google`
-- **Description**: Login/Register via Google Identity ID Token. Auto-links with existing email if previously registered via password.
+- **Description**: Login/Register via Google Identity ID Token. Enforces `email_verified == true`. Auto-links with existing email if previously registered via password. Rejects unverified email with `400 EMAIL_NOT_VERIFIED`.
 - **Auth**: Public
 - **Request Body**: `{"id_token": "google_jwt_identity_token"}`
 - **Response**: `200 OK`
@@ -108,7 +113,7 @@ Base URL: `/api/v1`
   ```
 
 ### 2.4 POST `/api/v1/auth/oauth/github`
-- **Description**: Login/Register via GitHub OAuth2 Authorization Code.
+- **Description**: Login/Register via GitHub OAuth2 Authorization Code. Queries `GET https://api.github.com/user/emails` to retrieve primary verified email. Returns `400 OAUTH_EMAIL_MISSING` if no verified email exists.
 - **Auth**: Public
 - **Request Body**: `{"code": "github_auth_code"}`
 - **Response**: `200 OK`
@@ -124,7 +129,11 @@ Base URL: `/api/v1`
   ```
 
 ### 2.5 POST `/api/v1/auth/refresh`
-- **Description**: Rotate refresh token and issue new token pair. Protected with 30s grace period against concurrent multi-tab refresh races.
+- **Description**: Rotate refresh token and issue new token pair.
+  - **Check 1**: JWT expiration timestamp (`401 REFRESH_TOKEN_EXPIRED`).
+  - **Check 2**: Redis Grace Period cache (within 30s concurrent requests receive cached new token pair).
+  - **Check 3**: Database revocation status (if already revoked $\rightarrow$ `401 REFRESH_TOKEN_REVOKED`, triggers Token Reuse Detection and revokes all user sessions).
+  - **Check 4**: Database user status (if `banned`/`suspended` $\rightarrow$ `401 USER_SUSPENDED`).
 - **Auth**: Public
 - **Request Body**: `{"refresh_token": "jwt..."}`
 - **Response**: `200 OK`
@@ -140,7 +149,7 @@ Base URL: `/api/v1`
   ```
 
 ### 2.6 POST `/api/v1/auth/logout`
-- **Description**: Revoke current refresh token session.
+- **Description**: Revoke current refresh token in database and immediately purge associated Redis grace period cache.
 - **Auth**: Required
 - **Request Body**: `{"refresh_token": "jwt..."}`
 - **Response**: `204 No Content`
@@ -270,41 +279,55 @@ Base URL: `/api/v1`
   {
     "task": "explain", // "explain" | "summarize" | "translate" | "simplify" | "chat"
     "conversation_id": "uuid-optional",
+    "reading_session_id": "uuid", // Required: Client tab/reading session UUID for tab isolation
     "tab_id": 101, // Tab isolation guarantee (FR-CNT-05)
     "page_url": "https://example.com/article",
     "page_title": "Example Article Title",
-    "selected_text": "Selected snippet to explain...",
-    "page_content": "Extracted clean text content of the article (up to 100KB)...",
+    "selected_text": "Selected snippet to explain...", // Max 10,000 chars
+    "page_content": "Extracted clean text content of the article...", // Max 102,400 chars (100KB)
     "content_type": "html_article", // "html_article" | "pdf_text"
-    "user_prompt": "Explain this concept in simple terms",
+    "user_prompt": "Explain this concept in simple terms", // Max 2,000 chars
     "provider": "gemini",
     "model": "gemini-1.5-flash",
     "bypass_protection": false // Set true only if user confirmed override
   }
   ```
 - **SSE Stream Output**:
-  ```text
-  event: start
-  data: {"conversation_id": "uuid", "message_id": "uuid"}
+  - *Success Stream Sequence*:
+    ```text
+    event: start
+    data: {"conversation_id": "uuid", "message_id": "uuid"}
 
-  event: token
-  data: {"content": "This ", "index": 0}
+    event: token
+    data: {"content": "This ", "index": 0}
 
-  event: token
-  data: {"content": "paragraph means...", "index": 1}
+    event: token
+    data: {"content": "paragraph means...", "index": 1}
 
-  event: citation
-  data: {"source_id": "p-14", "text_snippet": "Neural networks process data in layers", "is_grounded": true, "confidence": 0.95}
+    event: citation
+    data: {"source_id": "p-14", "text_snippet": "Neural networks process data in layers", "is_grounded": true, "confidence": 0.95}
 
-  event: done
-  data: {"message_id": "uuid", "finish_reason": "stop", "total_tokens": 142, "provider": "gemini", "model": "gemini-1.5-flash"}
+    event: done
+    data: {"message_id": "uuid", "finish_reason": "stop", "total_tokens": 142, "provider": "gemini", "model": "gemini-1.5-flash", "is_grounded": true, "uncertainty_flag": false, "grounding_notes": "Grounding verified against page context p-14"}
+    ```
+  - *Error Stream Sequence* (e.g. Quota exceeded or in-flight user suspension):
+    ```text
+    event: start
+    data: {"conversation_id": "uuid", "message_id": "uuid"}
 
-  event: error
-  data: {"code": "UPSTREAM_QUOTA_EXCEEDED", "detail": "Your Gemini API quota has been exhausted. Check Google AI Studio."}
-  ```
-- **Error & Disconnect Handling**:
-  - If an error occurs, the stream emits `event: error` and closes immediately. **No `done` event is sent after `error`**.
-  - If the client disconnects or closes the tab while generation is in progress, partial tokens received are saved to `messages` with `uncertainty_flag = true` and `grounding_notes = 'interrupted_by_client'` to prevent data loss.
+    event: token
+    data: {"content": "Partial response before...", "index": 0}
+
+    event: error
+    data: {"code": "UPSTREAM_QUOTA_EXCEEDED", "detail": "Your Gemini API quota has been exhausted. Check Google AI Studio."}
+    ```
+- **Error, Suspension & Disconnect Handling**:
+  - If an upstream error occurs, the stream emits `event: error` and closes immediately. **No `done` event is sent after `error`**.
+  - **In-Flight Cancellation**: Async generator inspects Redis key `revoked_users:{user_id}` on each token iteration. If user is banned/deleted mid-stream, stream terminates with `event: error` (`USER_SUSPENDED`) immediately.
+  - **Client Disconnect**:
+    - *Standard Mode*: Partial tokens are saved to `messages` with `uncertainty_flag = true` and `grounding_notes = 'interrupted_by_client'`.
+    - *Privacy Mode*: Ephemeral in-session chat only (RAM / `sessionStorage`). Zero rows are written to database `messages` even upon disconnect.
+    - *Upstream Socket Management*: The AI adapter explicitly executes `await upstream_stream.aclose()` in a `finally` block upon `asyncio.CancelledError`, immediately terminating upstream LLM token consumption to protect user credits and prevent backend socket leaks.
 
 ### 5.3 POST `/api/v1/ai/proactive-suggest` (Feature G)
 - **Description**: Generates an unobtrusive proactive hint when a user slows down or rereads a complex section.
@@ -332,6 +355,7 @@ Base URL: `/api/v1`
 
 ### 5.4 POST `/api/v1/ai/feedback` (BR-15 — Evaluation & User Feedback)
 - **Description**: Submit a helpful/unhelpful rating or inaccuracy report for an AI response.
+- **Privacy Notice**: Feedback is voluntary diagnostic telemetry explicitly shared with system administrators to tune model prompts and report upstream bugs.
 - **Auth**: Required (Message must belong to a conversation owned by the authenticated user)
 - **Duplicate Handling**: Submitting feedback again for the same `(user_id, message_id)` atomically updates the existing rating.
 - **Request Body**:
@@ -351,6 +375,7 @@ Base URL: `/api/v1`
 
 ### 6.1 POST `/api/v1/quiz/generate`
 - **Description**: Generate 3-5 comprehension quiz questions based on article content. Answers are hidden from the response payload.
+- **Privacy Mode**: When `privacy_mode_enabled: true`, the generated quiz is stored in Redis (`ephemeral_quiz:{quiz_id}` with 30m TTL) instead of the PostgreSQL `quiz_records` table.
 - **Auth**: Required
 - **Request Body**:
   ```json
@@ -410,18 +435,18 @@ Base URL: `/api/v1`
 - **Response**: `200 OK` `{"data": {"items": [...], "total": 15}}`
 
 ### 7.2 GET `/api/v1/conversations/{id}/messages`
-- **Description**: Get message history for a specific conversation.
+- **Description**: Get message history for a specific conversation. Returns `404 CONVERSATION_NOT_FOUND` if parent conversation is soft-deleted.
 - **Auth**: Required
-- **Query Params**: `page=1&limit=50&order=asc`
-- **Response**: `200 OK` `{"data": {"items": [...]}}`
+- **Query Params**: `page=1&page_size=50&order=asc`
+- **Response**: `200 OK` `{"data": {"items": [...], "total": 12, "page": 1, "page_size": 50, "total_pages": 1}}`
 
 ### 7.3 DELETE `/api/v1/conversations/{id}`
-- **Description**: Soft delete a specific conversation session and its messages (`FR-HIS-04`). Generates a sync tombstone.
+- **Description**: Soft delete a specific conversation session (`FR-HIS-04`). Sets `conversations.is_deleted = TRUE`, increments `version`, and generates a sync tombstone (retained for 30 days before permanent purging). Messages are automatically hidden.
 - **Auth**: Required
 - **Response**: `204 No Content`
 
 ### 7.4 POST `/api/v1/reading/history`
-- **Description**: Record a read article with dwell time and optional cached summary. Blocked if Privacy Mode is active.
+- **Description**: Record a read article with dwell time and optional cached summary.
 - **Auth**: Required
 - **Request Body**:
   ```json
@@ -432,23 +457,31 @@ Base URL: `/api/v1`
     "cached_summary": "Optional summary..."
   }
   ```
-- **Response**: `201 Created`
+- **Response (Standard)**: `201 Created`
+- **Response (Privacy Mode or Blacklisted Domain)**: `200 OK`
+  ```json
+  {
+    "data": null,
+    "message": "History logging skipped by privacy policy"
+  }
+  ```
 
 ### 7.5 GET `/api/v1/reading/history`
 - **Description**: List browsing and reading history with pagination and search.
 - **Auth**: Required
-- **Query Params**: `page=1&limit=20&search=keyword`
-- **Response**: `200 OK` `{"data": {"items": [...], "total": 35}}`
+- **Query Params**: `page=1&page_size=20&search=keyword`
+- **Response**: `200 OK` `{"data": {"items": [...], "total": 35, "page": 1, "page_size": 20, "total_pages": 2}}`
 
 ### 7.6 DELETE `/api/v1/reading/history`
 - **Description**: Clear entire browsing/reading history for the account (`FR-HIS-05`). Does not delete account or API keys.
+- **GDPR Footprint Anonymization**: In addition to deleting all rows in `reading_history`, atomically executes `UPDATE conversations SET page_url = NULL, page_title = NULL WHERE user_id = :user_id` to purge all URL browsing footprints from past chat sessions while preserving message discussions.
 - **Auth**: Required
 - **Response**: `204 No Content`
 
-### 7.7 POST `/api/v1/reading/highlights` & GET `/api/v1/reading/highlights`
-- **Description**: Create and list saved text highlights and personal notes.
+### 7.7 POST `/api/v1/reading/highlights`
+- **Description**: Save selected text passage and optional personal note.
 - **Auth**: Required
-- **POST Request Body**:
+- **Request Body**:
   ```json
   {
     "page_url": "https://example.com/article",
@@ -457,19 +490,58 @@ Base URL: `/api/v1`
     "color": "yellow"
   }
   ```
-- **Response**: `201 Created` `{"data": HighlightObject}`
+- **Response**: `201 Created`
+  ```json
+  {
+    "data": {
+      "id": "uuid",
+      "page_url": "https://example.com/article",
+      "highlighted_text": "Important text passage",
+      "user_note": "Remember for research paper",
+      "color": "yellow",
+      "version": 1,
+      "created_at": "2026-11-21T00:00:00Z"
+    }
+  }
+  ```
+
+### 7.8 GET `/api/v1/reading/highlights`
+- **Description**: List saved highlights with pagination and optional URL filter.
+- **Auth**: Required
+- **Query Params**: `page=1&page_size=20&page_url=https://example.com/article`
+- **Response**: `200 OK`
+  ```json
+  {
+    "data": {
+      "items": [
+        {
+          "id": "uuid",
+          "page_url": "https://example.com/article",
+          "highlighted_text": "Important text passage",
+          "user_note": "Remember for research paper",
+          "color": "yellow",
+          "created_at": "2026-11-21T00:00:00Z"
+        }
+      ],
+      "total": 1,
+      "page": 1,
+      "page_size": 20,
+      "total_pages": 1
+    }
+  }
+  ```
 
 ---
 
 ## 8. Multi-Device Synchronization (`/api/v1/sync` — Feature J)
 
 ### 8.1 POST `/api/v1/sync/pull`
-- **Description**: Pull changes updated on other devices since client's cursor timestamp. Includes soft-deleted records as tombstones.
+- **Description**: Pull changes updated on other devices since client's cursor. Uses a **Composite Cursor** `(updated_at, id)` to prevent skipping items when multiple records share the exact same timestamp. Includes soft-deleted records as tombstones. Messages are excluded (loaded on-demand).
 - **Auth**: Required
 - **Request Body**:
   ```json
   {
-    "cursor": "2026-11-21T00:00:00.000Z",
+    "cursor": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowMDowMC4wMDBaIiwiaWQiOiJjOGE0MTdkZi0xYjRlIn0=", // Base64 of {"t": "timestamp", "id": "uuid"} (null for initial pull)
     "limit": 100
   }
   ```
@@ -480,7 +552,7 @@ Base URL: `/api/v1`
       "updated_conversations": [...],
       "updated_highlights": [...],
       "updated_settings": {...},
-      "next_cursor": "2026-11-21T00:05:00.000Z",
+      "next_cursor": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowNTowMC4wMDBaIiwiaWQiOiJmOGExOTdhMi0yYjVlIn0=",
       "has_more": false
     }
   }
@@ -532,7 +604,7 @@ Base URL: `/api/v1`
 ### 9.2 GET `/api/v1/admin/users`
 - **Description**: List user accounts with role, status, and last activity timestamps.
 - **Auth**: Required (Role `admin`)
-- **Query Params**: `page=1&limit=50&status=active`
+- **Query Params**: `page=1&page_size=50&status=active`
 - **Response**: `200 OK`
   ```json
   {
@@ -547,13 +619,18 @@ Base URL: `/api/v1`
           "created_at": "2026-11-14T08:00:00Z"
         }
       ],
-      "total": 128
+      "total": 128,
+      "page": 1,
+      "page_size": 50,
+      "total_pages": 3
     }
   }
   ```
 
 ### 9.3 PATCH `/api/v1/admin/users/{id}/status`
-- **Description**: Update user account status (e.g. suspend or ban).
+- **Description**: Update user account status (e.g. suspend or ban). Rejects self-modification with `400 CANNOT_MODIFY_SELF_STATUS` if `id == current_user.id` to prevent accidental platform administrative lockout.
+  - **Ban / Suspend**: Sets PostgreSQL `users.status = status`, revokes all user refresh tokens in DB, and sets Redis marker `revoked_users:{user_id} = status` (TTL = 3600s) for immediate session invalidation.
+  - **Reactivate (`active`)**: Sets `users.status = 'active'` and immediately deletes `revoked_users:{user_id}` from Redis.
 - **Auth**: Required (Role `admin`)
 - **Request Body**: `{"status": "suspended"}` // "active" | "suspended" | "banned"
 - **Response**: `200 OK`
@@ -568,8 +645,9 @@ Base URL: `/api/v1`
 
 ### 9.4 GET `/api/v1/admin/feedback`
 - **Description**: Retrieve user satisfaction logs and categorized problem reports (BR-15).
+- **Privacy Guardrail**: Feedback is voluntary diagnostic telemetry explicitly shared by users. The `comment` string passes through automatic heuristic PII redaction before presentation to protect inadvertent user pastes.
 - **Auth**: Required (Role `admin`)
-- **Query Params**: `page=1&limit=50`
+- **Query Params**: `page=1&page_size=50`
 - **Response**: `200 OK`
   ```json
   {
@@ -584,7 +662,10 @@ Base URL: `/api/v1`
           "created_at": "2026-11-20T14:30:00Z"
         }
       ],
-      "total": 15
+      "total": 15,
+      "page": 1,
+      "page_size": 50,
+      "total_pages": 1
     }
   }
   ```

@@ -69,6 +69,7 @@ erDiagram
     conversations {
         uuid id PK
         uuid user_id FK
+        uuid reading_session_id
         string title
         text page_url
         string page_title

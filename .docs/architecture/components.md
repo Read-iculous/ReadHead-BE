@@ -13,7 +13,7 @@ app/
 │   ├── exceptions.py          # Standard domain exceptions and HTTP error handlers
 │   ├── privacy/               # Sensitive Data & Privacy Subsystem (Feature H)
 │   │   ├── pii_detector.py    # Regex & heuristic detection for credentials, keys, PII
-│   │   └── domain_filter.py   # Domain blacklist & whitelist evaluator
+│   │   └── domain_filter.py   # Domain blacklist evaluator
 │   └── ai/                    # Unified AI Provider Subsystem (Features C & E)
 │       ├── base.py            # BaseAIProvider abstract interface
 │       ├── factory.py         # ProviderFactory to instantiate provider adapters
@@ -90,9 +90,10 @@ app/
 
 ### 2.3 Synchronization & Conflict Resolution Engine (`app/services/sync_service.py`)
 - Enforces **Feature J** (`FR-SYN-01~08`):
-  1. Uses **Optimistic Concurrency Control** via `version` numbers and `updated_at` timestamps on all synchronized entities (conversations, messages, settings, highlights).
-  2. Incremental `pull` returns changes since `last_synced_version`.
-  3. Batch `push` applies changes. If a client submits an update with a stale base version, the server detects a collision and returns `SYNC_CONFLICT` with both versions, allowing deterministic resolution without silent data loss.
+  1. Uses **Optimistic Concurrency Control** via `version` numbers and `updated_at` timestamps on synchronized mutable entities (`conversations`, `settings`, `highlights`).
+  2. Individual `messages` are **append-only and immutable**; they are excluded from sync pull and fetched on-demand via `GET /api/v1/conversations/{id}/messages`.
+  3. Incremental `pull` uses a **Composite Cursor** `(updated_at, id)` with pagination (`limit: 100`, `next_cursor`, `has_more`) ensuring zero skipped or duplicated records even when items share identical timestamps.
+  4. Batch `push` applies changes atomically. If a client submits an update with a stale base version, the server detects a collision and returns `409 SYNC_CONFLICT` with both versions, allowing deterministic resolution without silent data loss.
 
 ### 2.4 Accessibility Profile Manager (`app/services/user_service.py`)
 - Enforces **BG-06** and **BR-11**:
@@ -108,3 +109,9 @@ app/
 - Enforces **Feature L** (`FR-OPS-01~05`):
   - Returns database connection latency, system uptime, and environment status.
   - Strictly strips all user credentials, decrypted API keys, and sensitive page context from application logs (`FR-OPS-03`).
+
+### 2.6 Rate Limiting & Reverse Proxy Shield (`app/core/limiter.py`)
+- Configures Redis-backed `slowapi.Limiter` with proxy-aware key functions:
+  1. **Authenticated Endpoints** (`/ai/stream`, `/sync/*`): Keyed by authenticated `user_id` to guarantee user-level rate isolation.
+  2. **Public Auth Endpoints** (`/auth/login`, `/auth/register`): Keyed by client IP extracted from `X-Forwarded-For` via trusted proxy middleware (`uvicorn --proxy-headers`), preventing Reverse Proxy IP collations that could cause system-wide lockouts.
+  3. **High-Availability Fallback**: If Redis becomes temporarily unreachable, limiter gracefully falls back to in-memory counters to prevent 500 errors.

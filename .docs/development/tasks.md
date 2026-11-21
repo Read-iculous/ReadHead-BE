@@ -54,16 +54,18 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 - **Feature Reference**: Feature L (`FR-OPS-01~05`), `NFR-MNT-01`
 - **Description**: Initialize the project directory layout, dependencies, environment settings via Pydantic Settings, database session lifecycle, error handlers, and a public `/api/v1/health` endpoint.
 - **Plan & Codebase**:
-  - `requirements.txt` & `requirements-dev.txt`: Pin FastAPI, Uvicorn, SQLAlchemy, asyncpg, Pydantic, etc.
-  - `app/core/config.py`: Implement `Settings` class loading `.env` parameters (`DATABASE_URL`, `JWT_SECRET_KEY`, `ENCRYPTION_MASTER_KEY`, `CORS_ORIGINS`).
+  - `requirements.txt` & `requirements-dev.txt`: Pin FastAPI, Uvicorn, SQLAlchemy, asyncpg, redis, Pydantic, etc.
+  - `app/core/config.py`: Implement `Settings` class loading `.env` parameters (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET_KEY`, `ENCRYPTION_MASTER_KEY`, `CORS_ORIGINS`). Enforce Pydantic key separation validator (`JWT_SECRET_KEY != ENCRYPTION_MASTER_KEY`) failing fast on startup if identical.
   - `app/core/database.py`: Configure asynchronous engine `create_async_engine`, sessionmaker `AsyncSessionLocal`, and `get_db` dependency.
+  - `app/core/redis.py`: Configure asynchronous Redis connection pool and ping utility.
   - `app/core/exceptions.py`: Define base `AppException` and exception handlers for standard JSON envelopes.
-  - `app/routers/health.py`: Create `GET /api/v1/health` returning system status and DB ping.
-  - `app/main.py`: Assemble FastAPI instance, CORS middleware, router mounting, and lifespan management.
+  - `app/routers/health.py`: Create `GET /api/v1/health` returning system status, latency checks for database and redis.
+  - `app/main.py`: Assemble FastAPI instance, CORS middleware with `allow_origin_regex=r"^chrome-extension://[a-z0-9]+$"` to support credentials without wildcard failures, router mounting, and lifespan management.
 - **Acceptance Criteria**:
   - Server starts cleanly via `uvicorn app.main:app --port 8000`.
-  - `GET /api/v1/health` returns `200 OK` with JSON `{"status": "healthy", "database": "connected"}`.
-  - CORS middleware accepts origins configured in `CORS_ORIGINS`.
+  - `GET /api/v1/health` returns `200 OK` with JSON checks (`checks.database` and `checks.redis` reporting healthy status and latency).
+  - Returns `503 Service Unavailable` if PostgreSQL or Redis connection fails.
+  - CORS middleware accepts origins configured in `CORS_ORIGINS` and regex-matches Chrome Extension origins.
   - Unhandled exceptions return structured JSON (`code: "INTERNAL_SERVER_ERROR"`), never raw HTML traces.
 - **Verification / Screenshot**:
   - Command: `curl -i http://localhost:8000/api/v1/health`
@@ -106,13 +108,16 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `app/services/auth_service.py`: Business logic for credential checking, duplicate email validation, token rotation, and 30-second Redis concurrency grace period.
   - `app/routers/auth.py`: Endpoints `POST /register`, `POST /login`, `POST /refresh`, `POST /logout`.
 - **Acceptance Criteria**:
-  - `POST /register` with valid data returns `201 Created` and initial tokens.
+  - `POST /register` with valid data returns `201 Created` with User profile object (`id`, `email`, `full_name`, `role`, `status`).
   - Duplicate registration returns `409 EMAIL_ALREADY_EXISTS`.
   - Invalid login returns `401 INVALID_CREDENTIALS`.
+  - Inactive/suspended user login returns `401 USER_SUSPENDED`.
+  - Token hash comparisons use constant-time `secrets.compare_digest` to prevent timing attacks.
+  - Auth dependency `get_current_user` catches `RedisError` gracefully and falls back to checking `users.status` directly in PostgreSQL if Redis is offline.
   - `POST /refresh` with valid refresh token rotates and issues a new access + refresh token pair.
   - Concurrent multi-tab refresh requests presenting the same old token within 30 seconds are safely served the new token pair without revocation errors.
   - Revoked or reused tokens outside the grace period return `401 REFRESH_TOKEN_REVOKED` and trigger immediate session invalidation.
-  - `POST /logout` marks the refresh token as revoked.
+  - `POST /logout` marks the refresh token as revoked in DB and purges Redis grace period cache.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_auth_api.py -v`
   - Screenshot: Postman or Swagger UI showing `POST /api/v1/auth/login` returning tokens and subsequent authenticated call to `/api/v1/users/me` with Bearer header.
@@ -121,14 +126,16 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 
 ### [BE-04] OAuth2 Integration (Google & GitHub)
 - **Feature Reference**: Feature A (`FR-ACC-01`), `.docs/technical/auth-flow.md`
-- **Description**: Implement third-party OAuth2 authentication endpoints for Google and GitHub, linking external identities to ReadHead user accounts.
+- **Description**: Implement third-party OAuth2 authentication endpoints for Google (via Google ID Token) and GitHub (via Auth Code), enforcing email verification and auto-linking external identities to ReadHead user accounts.
 - **Plan & Codebase**:
-  - `app/schemas/auth.py`: `GoogleAuthRequest` (id_token/code), `GitHubAuthRequest` (code).
-  - `app/services/auth_service.py`: Add `authenticate_google()` and `authenticate_github()` using `httpx.AsyncClient` to verify provider tokens and fetch profiles.
+  - `app/schemas/auth.py`: `GoogleAuthRequest` (`id_token`), `GitHubAuthRequest` (`code`).
+  - `app/services/auth_service.py`: Add `authenticate_google()` verifying ID Token with Google and `authenticate_github()` fetching profile and verified primary email via GitHub API.
+  - Enforce `email_verified == true` before account creation or auto-linking (`400 EMAIL_NOT_VERIFIED` or `400 OAUTH_EMAIL_MISSING`).
   - Link or create user in `oauth_accounts` table; generate standard ReadHead JWT pair.
   - `app/routers/auth.py`: Mount `POST /api/v1/auth/oauth/google` and `POST /api/v1/auth/oauth/github`.
 - **Acceptance Criteria**:
   - Valid OAuth payload authenticates existing user or creates a new user profile with `is_verified: true`.
+  - Auto-links to existing account if email matches and provider confirms email verification.
   - Returns `200 OK` with standard `TokenResponse`.
   - Handled network errors or rejected provider tokens return `401 TOKEN_INVALID`.
 - **Verification / Screenshot**:
@@ -178,20 +185,20 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 
 ### [BE-07] AES-256 Encrypted API Key Vault & Validation Engine
 - **Feature Reference**: Feature C (`FR-KEY-01~07`), `ADR-003`
-- **Description**: Provide secure storage for user-provided LLM API keys (OpenAI, Gemini, Claude). Keys are encrypted at rest with AES-256-GCM, masked in responses, validated via upstream ping check before storage, and isolated per provider.
+- **Description**: Provide secure storage for user-provided LLM API keys (OpenAI, Gemini, Claude). Keys are encrypted at rest with AES-256-GCM, masked in responses, validated via upstream ping check before storage, and isolated per provider. Employs a dual-key Keyring for 100% zero-downtime key rotation.
 - **Plan & Codebase**:
-  - `app/core/security.py`: Add `encrypt_secret()` and `decrypt_secret()` using `ENCRYPTION_MASTER_KEY`.
+  - `app/core/security.py`: Add `encrypt_secret()` (enforcing CSPRNG `secrets.token_bytes(12)` nonce for every encryption to eliminate GCM nonce reuse) and `decrypt_secret()` supporting `ENCRYPTION_MASTER_KEYS` dictionary keyring and `CURRENT_KEY_VERSION`.
   - `app/schemas/api_key.py`: `ApiKeyCreateRequest`, `ApiKeyResponse` (with masked `key_hint`), `KeyValidationResponse`.
   - `app/services/api_key_service.py`: Add methods to store, retrieve, delete, and test keys. Enforce UPSERT behavior (atomic replace upon successful ping test; preserves old key if validation fails).
-  - `app/cli/rotate_keys.py`: CLI maintenance utility (`python -m app.cli.rotate_keys --old-key ... --new-key ...`) to re-encrypt stored keys when rotating master secrets.
+  - `app/cli/rotate_keys.py`: CLI maintenance utility (`python -m app.cli.rotate_keys --old-version v1 --new-version v2`) to re-encrypt stored keys when rotating master secrets without downtime.
   - `app/routers/api_keys.py`: Endpoints `GET /api/v1/api-keys`, `POST /api/v1/api-keys`, `DELETE /api/v1/api-keys/{provider}`, `POST /api/v1/api-keys/{provider}/validate`.
 - **Acceptance Criteria**:
-  - Plaintext key is encrypted before writing to PostgreSQL (format: `v1:<nonce>:<ciphertext>:<tag>`); database inspect shows ciphertext.
+  - Plaintext key is encrypted before writing to PostgreSQL (format: `<version>:<nonce>:<ciphertext>:<tag>`); database inspect shows ciphertext.
   - `GET /api-keys` returns only masked previews (`sk-...4aF9`), never the decrypted key.
   - `POST /api-keys/{provider}/validate` performs a lightweight ping to the external provider:
     - If valid: returns `200 OK` with `valid: true`.
     - If invalid: returns `400 KEY_VALIDATION_FAILED` and rejects activation.
-  - Key rotation script successfully upgrades existing `v1` ciphers to `v2` without downtime.
+  - Key rotation CLI successfully migrates existing `v1` ciphers to `v2` without interrupting running workers or causing downtime.
   - Logs never contain plaintext keys (`FR-KEY-07`, `FR-OPS-03`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/unit/test_security_vault.py tests/integration/test_api_keys_api.py -v`
@@ -210,9 +217,12 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `app/core/ai/gemini_adapter.py`: Async streaming implementation using `google-generativeai`.
   - `app/core/ai/claude_adapter.py`: Async streaming implementation using `anthropic.AsyncAnthropic`.
   - `app/core/ai/factory.py`: `ProviderFactory` to instantiate adapters based on provider name and decrypted user key.
+  - `app/core/ai/formatter.py`: `HistoryFormatter` normalizing multi-turn history across providers (maps `assistant` -> `model` for Gemini; merges consecutive same-role turns to satisfy Anthropic Claude turn alternating requirements).
   - `app/core/ai/grounding.py`: Prompt engineering templates enforcing source-grounding priority, uncertainty declarations, and citation markers (`BR-12~14`).
 - **Acceptance Criteria**:
   - All three adapters implement the exact same interface and yield standardized chunk strings.
+  - HistoryFormatter cleanly transforms conversation threads across Gemini, OpenAI, and Claude without provider-specific syntax errors.
+  - Adapters wrap upstream calls in `try...finally` executing `await upstream_stream.aclose()` upon `asyncio.CancelledError`, preventing credit drain and socket leaks.
   - Unit tests with mock responses verify that each adapter properly handles rate limits, token timeouts, and authentication errors.
   - Grounding prompts instruct models to explicitly declare when answers rely on external training data vs current page text.
 - **Verification / Screenshot**:
@@ -300,16 +310,17 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 ## Phase 7: Reading Data & Community Feedback (Features I & E)
 
 ### [BE-13] Tab-Isolated Conversations & Message History
-- **Feature Reference**: Feature D (`FR-CNT-05~07`), Feature I (`FR-HIS-01~10`)
-- **Description**: Manage reading conversation threads, guaranteeing strict tab isolation, chronological message retrieval, source grounding flags, and single-session deletion.
+- **Feature Reference**: Feature D (`FR-CNT-05~07`), Feature I (`FR-HIS-01~10`), `ADR-012`
+- **Description**: Manage reading conversation threads, guaranteeing strict tab isolation via `reading_session_id`, chronological message retrieval, source grounding flags, and soft deletion with tombstone persistence.
 - **Plan & Codebase**:
   - `app/schemas/conversation.py`: `ConversationResponse`, `MessageResponse` (with `is_grounded`, `uncertainty_flag`).
-  - `app/services/conversation_service.py`: Create sessions, append messages, list conversations with search, and delete specific conversations.
-  - `app/routers/conversations.py`: `GET /conversations`, `GET /conversations/{id}/messages`, `DELETE /conversations/{id}`.
+  - `app/services/conversation_service.py`: Create sessions, bind `reading_session_id`, append messages (in an atomic transaction that bumps `conversations.updated_at = NOW()` and `conversations.version = version + 1`), list conversations with search, and soft delete conversations (`is_deleted = TRUE`).
+  - `app/routers/conversations.py`: `GET /conversations`, `GET /conversations/{id}/messages` (returns 404 if conversation is soft-deleted), `DELETE /conversations/{id}`.
 - **Acceptance Criteria**:
-  - Conversations from different browser tabs remain isolated; messages cannot be appended across mismatched sessions (`FR-CNT-05`).
+  - Conversations from different browser tabs remain isolated using client-provided `reading_session_id`; mismatched un-bound requests reject with `400 TAB_CONTEXT_MISMATCH` (`FR-CNT-05`).
+  - Appending a message atomically increments conversation `version` and updates `updated_at`, ensuring sync detection and proper sorting.
   - Historical messages include `is_grounded` and `uncertainty_flag` metadata.
-  - `DELETE /conversations/{id}` deletes the session and cascades to messages (`FR-HIS-04`).
+  - `DELETE /conversations/{id}` performs soft delete (`is_deleted = TRUE`), generating a sync tombstone retained for 30 days. Child messages are hidden from GET queries.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_conversations_api.py -v`
   - Screenshot: Swagger UI response for `/api/v1/conversations/{id}/messages` showing message history with grounding metadata.
@@ -320,14 +331,14 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 - **Feature Reference**: Feature I (`FR-HIS-01~06`, `BR-18~21`)
 - **Description**: Store visited reading pages, dwell time, and user-saved text highlights with color tags and notes. Support bulk history clearance without deleting account credentials.
 - **Plan & Codebase**:
-  - `app/schemas/reading.py`: `ReadingHistoryCreate`, `ReadingHistoryResponse`, `HighlightCreate`, `HighlightResponse`.
+  - `app/schemas/reading.py`: `ReadingHistoryCreate`, `ReadingHistoryResponse`, `HighlightCreate`, `HighlightResponse`, `HighlightListResponse`.
   - `app/services/reading_service.py`: Record history (bypassed if privacy mode or blacklisted domain), save highlights, clear history.
   - `app/routers/reading.py`: `POST /api/v1/reading/history`, `GET /api/v1/reading/history`, `DELETE /api/v1/reading/history`, `POST /api/v1/reading/highlights`, `GET /api/v1/reading/highlights`.
 - **Acceptance Criteria**:
-  - If `privacy_mode_enabled: true` or URL is blacklisted, `POST /api/v1/reading/history` returns `200 OK` with null data without saving to DB.
-  - `GET /api/v1/reading/history` returns paginated reading logs with dwell time and cached summaries.
-  - Highlights are retrievable by `page_url` filter.
-  - `DELETE /api/v1/reading/history` clears browsing logs while preserving account credentials and API keys (`FR-HIS-05`, `FR-HIS-07`).
+  - If `privacy_mode_enabled: true` or URL is blacklisted, `POST /api/v1/reading/history` returns `200 OK` with `data: null` and message `"History logging skipped by privacy policy"` without writing to DB.
+  - `GET /api/v1/reading/history` returns paginated reading logs with dwell time and cached summaries using query params `page` and `page_size`.
+  - Dedicated endpoint `GET /api/v1/reading/highlights` lists highlights with pagination and `page_url` filter.
+  - `DELETE /api/v1/reading/history` clears browsing logs and atomically sets `conversations.page_url = NULL, conversations.page_title = NULL` to eliminate past browsing ghost footprints under GDPR (`FR-HIS-05`, `FR-HIS-07`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_reading_history_api.py -v`
   - Screenshot: Response of `DELETE /api/v1/reading/history` returning `204 No Content` and verifying database rows wiped.
@@ -354,15 +365,16 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 ## Phase 8: Multi-Device Sync & Concurrency (Feature J)
 
 ### [BE-16] Multi-Device Incremental Synchronization & Conflict Resolver
-- **Feature Reference**: Feature J (`FR-SYN-01~08`), `ADR-007`
-- **Description**: Implement incremental pull and push endpoints for multi-device data synchronization using optimistic locking to prevent silent data overwrites.
+- **Feature Reference**: Feature J (`FR-SYN-01~08`), `ADR-007`, `ADR-013`
+- **Description**: Implement incremental pull and push endpoints for multi-device data synchronization using optimistic locking to prevent silent data overwrites. Uses a Composite Cursor `(updated_at, id)` to prevent skipped records.
 - **Plan & Codebase**:
-  - `app/schemas/sync.py`: `SyncPullRequest`, `SyncPullResponse`, `SyncPushRequest`, `SyncConflictResponse`.
-  - `app/services/sync_service.py`: Compare entity `version` and `updated_at`. If incoming mutation has a base version lower than current server version, raise a conflict.
+  - `app/schemas/sync.py`: `SyncPullRequest` (with Base64 composite cursor `{"t": "timestamp", "id": "uuid"}`), `SyncPullResponse`, `SyncPushRequest`, `SyncConflictResponse`.
+  - `app/services/sync_service.py`: Query mutable entities (`conversations`, `highlights`, `user_settings`) using `(updated_at, id)` composite cursor. Excludes `messages` (loaded on-demand). Compare entity `version` and `updated_at`.
+  - `app/cli/purge_tombstones.py`: CLI maintenance utility (`python -m app.cli.purge_tombstones --days 30`) to permanently delete tombstones older than 30 days (PostgreSQL `ON DELETE CASCADE` purges child messages and feedback).
   - `app/routers/sync.py`: Mount `POST /api/v1/sync/pull` and `POST /api/v1/sync/push`.
 - **Acceptance Criteria**:
-  - `POST /sync/pull` returns modified records paginated by `cursor` and `limit` (max 100), along with `next_cursor` and `has_more`.
-  - `POST /sync/push` applies mutations atomically and increments entity version numbers.
+  - `POST /sync/pull` returns modified records paginated by composite cursor `(updated_at, id)` and `limit` (max 100), along with `next_cursor` and `has_more`.
+  - `POST /sync/push` applies mutations atomically via conditional SQL update (`WHERE id = :id AND version = :base_version RETURNING id`), strictly preventing multi-threaded race condition silent overwrites (`FR-SYN-05`).
   - In a conflict situation (stale version submitted), server returns `409 SYNC_CONFLICT` with both versions, strictly preventing silent data loss (`FR-SYN-05`).
   - In-flight unsent drafts are excluded from synchronization (`FR-SYN-07`).
 - **Verification / Screenshot**:
@@ -396,14 +408,17 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 - **Feature Reference**: Web Management Portal, Feature L (`FR-OPS-01~05`)
 - **Description**: Implement platform telemetry aggregation, user management (suspend/ban accounts), feedback browsing, and Redis-backed IP/User rate limiting (`slowapi`).
 - **Plan & Codebase**:
-  - `app/core/limiter.py`: Configure Redis-backed `slowapi.Limiter` to protect AI endpoints from burst abuse.
+  - `app/core/limiter.py`: Configure Redis-backed `slowapi.Limiter` to protect AI endpoints from burst abuse (keys by `user_id` for authenticated routes; uses `X-Forwarded-For` with proxy headers for public routes; falls back to in-memory if Redis down).
+  - `app/cli/create_admin.py`: CLI command (`python -m app.cli.create_admin --email ... --password ...`) to bootstrap the initial superuser account.
   - `app/schemas/admin.py`: `TelemetryResponse`, `AdminUserListResponse`, `UserStatusUpdateRequest`, `AdminFeedbackResponse`.
   - `app/services/admin_service.py`: Aggregate request volume, upstream model breakdown (without reading user prompt text), update account statuses, list feedback logs.
   - `app/routers/admin.py`: Mount `GET /api/v1/admin/telemetry`, `GET /api/v1/admin/users`, `PATCH /api/v1/admin/users/{id}/status`, `GET /api/v1/admin/feedback` protected by `require_admin` dependency.
 - **Acceptance Criteria**:
   - All `/api/v1/admin/*` endpoints strictly reject non-admin users with `403 FORBIDDEN_RESOURCE`.
   - Telemetry numbers are aggregated purely from counters and logs with **zero plaintext user reading materials exposed** (strict privacy isolation guarantee).
-  - Banning/suspending a user immediately sets `revoked_users:{user_id}` in Redis (TTL=3600s), revoking all active sessions and blocking in-flight access tokens within 1ms.
+  - Admin feedback table applies heuristic PII redaction to the `comment` field before presentation.
+  - Rejects attempts by an administrator to suspend, ban, or modify their own status (`400 CANNOT_MODIFY_SELF_STATUS`).
+  - Banning/suspending a user updates PostgreSQL `users.status`, revokes all refresh tokens, and immediately sets `revoked_users:{user_id}` in Redis (TTL=3600s). Re-activating deletes the Redis key.
   - Excessive requests hit rate limits with standard `429 Too Many Requests` headers; SSE endpoint limits active concurrency to max 2 streams.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_admin_portal.py -v`
