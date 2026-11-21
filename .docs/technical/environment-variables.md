@@ -12,11 +12,11 @@ All environment variables are loaded and validated at startup using Pydantic Set
 | `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection URL for rate limiting, token blacklist & cache |
 | `JWT_SECRET_KEY` | **Yes** | — | High-entropy secret key used to sign Access and Refresh JWTs |
 | `JWT_ALGORITHM` | No | `HS256` | JWT signing algorithm |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `60` | Lifespan of Access Tokens (default: 1 hour) |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | No | `15` | Lifespan of Access Tokens (default: 15 minutes) |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | No | `30` | Lifespan of Refresh Tokens (default: 30 days) |
-| `ENCRYPTION_MASTER_KEY` | **Yes** | — | 32-byte base64-encoded key for AES-256-GCM vault encryption (primary key) |
-| `ENCRYPTION_MASTER_KEYS`| No | `{}` | JSON dictionary of key versions for zero-downtime rotation e.g. `{"v1":"...", "v2":"..."}` |
-| `CURRENT_KEY_VERSION` | No | `"v1"` | Active version prefix for encrypting new keys (`v1`, `v2`) |
+| `ENCRYPTION_MASTER_KEY` | Conditional | — | 32-byte base64-encoded key for AES-256-GCM. Used as default single key in dev or fallback if `ENCRYPTION_MASTER_KEYS` is omitted |
+| `ENCRYPTION_MASTER_KEYS`| No | `{}` | JSON dictionary of key versions e.g. `{"v1":"...", "v2":"..."}`. **Takes precedence over `ENCRYPTION_MASTER_KEY`** |
+| `CURRENT_KEY_VERSION` | No | `"v1"` | Active version prefix used when encrypting new API keys |
 | `GOOGLE_CLIENT_ID` | Conditional | `""` | Google OAuth2 Client ID for extension login |
 | `GOOGLE_CLIENT_SECRET` | Conditional | `""` | Google OAuth2 Client Secret |
 | `GITHUB_CLIENT_ID` | Conditional | `""` | GitHub OAuth2 Client ID |
@@ -36,10 +36,12 @@ REDIS_URL=redis://localhost:6379/0
 # Security & JWT (Must be strictly distinct from ENCRYPTION_MASTER_KEY)
 JWT_SECRET_KEY=change_this_to_a_super_secret_high_entropy_random_string_32_chars_min
 JWT_ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=60
+ACCESS_TOKEN_EXPIRE_MINUTES=15
 REFRESH_TOKEN_EXPIRE_DAYS=30
 
 # Symmetrical Key Vault (AES-256-GCM Master Keyring - Must NEVER match JWT_SECRET_KEY)
+# Precedence Rule: If ENCRYPTION_MASTER_KEYS is provided and non-empty, it takes strict precedence over ENCRYPTION_MASTER_KEY.
+# ENCRYPTION_MASTER_KEY serves as single-key dev fallback.
 # Generate via: python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
 ENCRYPTION_MASTER_KEY=your_base64_encoded_32_byte_master_encryption_key_here
 CURRENT_KEY_VERSION=v1

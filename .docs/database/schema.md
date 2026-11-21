@@ -97,14 +97,14 @@ Chat sessions tied to specific reading contexts. Tab-isolated via `reading_sessi
 |---|---|---|---|---|
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
-| `reading_session_id` | `UUID` | YES | NULL | Active reading session/tab UUID (NULL when opened from Dashboard) |
+| `reading_session_id` | `UUID` | YES | NULL | Active reading session/tab UUID. Binds dynamically via `/conversations/{id}/bind`. NULL when opened in unbound mode from Dashboard |
 | `title` | `VARCHAR(255)` | NO | `'New Conversation'` | Title / summary of conversation |
-| `page_url` | `TEXT` | YES | NULL | Web page URL where conversation started |
+| `page_url` | `TEXT` | YES | NULL | Web page URL where conversation started. Set to NULL upon reading history clearance or in Privacy Mode |
 | `page_title` | `VARCHAR(500)` | YES | NULL | Document / page title |
-| `version` | `INTEGER` | NO | `1` | Sync version (Feature J) |
-| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag (tombstone for sync, purged after 30 days) |
+| `version` | `INTEGER` | NO | `1` | Optimistic lock & sync version. Incremented on every message, title update, soft delete, or history clearance |
+| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag (tombstone for sync, purged after 30 days. Cursors >30 days trigger `410 CURSOR_EXPIRED`) |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Session start |
-| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last update / message timestamp |
+| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last update / message / clearance timestamp |
 
 ### 2.7 `messages` (Feature E — AI Reading Assistance)
 Individual turns in a conversation with source grounding metadata.

@@ -18,13 +18,15 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 ### 2.1 Authentication & Authorization (`401`, `403` — Feature A)
 | HTTP Status | Error Code | Description |
 |---|---|---|
+| `401` | `UNAUTHORIZED` | Authentication credentials missing, invalid or malformed |
 | `401` | `INVALID_CREDENTIALS` | Incorrect email or password |
 | `401` | `TOKEN_EXPIRED` | Access token has expired; client should refresh |
 | `401` | `TOKEN_INVALID` | Malformed or improperly signed JWT |
 | `401` | `REFRESH_TOKEN_EXPIRED` | Refresh token expired; user must log in again |
-| `401` | `REFRESH_TOKEN_REVOKED` | Refresh token was explicitly logged out or invalidated |
+| `401` | `REFRESH_TOKEN_REVOKED` | Refresh token was explicitly logged out, rotated or invalidated |
 | `401` | `USER_SUSPENDED` | Account has been suspended or banned by administrator |
 | `403` | `ACCOUNT_INACTIVE` | Account has been deactivated |
+| `403` | `EMAIL_NOT_VERIFIED` | OAuth identity provider indicates email has not been verified |
 | `403` | `FORBIDDEN_RESOURCE` | User does not own the requested resource |
 
 ### 2.2 Validation & Client Errors (`400`, `422`)
@@ -32,6 +34,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 |---|---|---|
 | `422` | `VALIDATION_ERROR` | Pydantic schema validation failure |
 | `400` | `INVALID_JSON` | Malformed JSON request body |
+| `400` | `OAUTH_EMAIL_MISSING` | OAuth provider account has no public or verified email address |
 | `400` | `CANNOT_MODIFY_SELF_STATUS` | Administrators cannot suspend, ban, or alter their own account status |
 | `400` | `QUIZ_ALREADY_SUBMITTED` | Quiz has already been submitted and graded |
 | `409` | `EMAIL_ALREADY_EXISTS` | Registration email already registered |
@@ -52,10 +55,12 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `400` | `SENSITIVE_DATA_DETECTED` | Request text contains credentials, keys, or PII. Blocked by default policy |
 | `400` | `DOMAIN_BLOCKED_BY_PRIVACY`| Target domain is in user's privacy blacklist |
 
-### 2.5 Multi-Device Synchronization & Concurrency (`409` — Feature J)
+### 2.5 Multi-Device Synchronization & Concurrency (`409`, `410` — Feature J)
 | HTTP Status | Error Code | Description |
 |---|---|---|
 | `409` | `SYNC_CONFLICT` | Stale version detected. Target record was updated by another device |
+| `409` | `CONVERSATION_BUSY` | Conversation is actively streaming tokens in another tab session |
+| `410` | `CURSOR_EXPIRED` | Sync cursor timestamp is older than 30 days (tombstones purged). Client must trigger full resync |
 | `400` | `INVALID_SYNC_MUTATION` | Malformed mutation payload or unknown entity type |
 
 ### 2.6 AI Gateway & BYOK Errors (`400`, `502`, `504` — Features C & E)
@@ -76,7 +81,9 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `500` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 | `500` | `DATABASE_ERROR` | Database connection or execution failure |
 | `500` | `ENCRYPTION_ERROR` | Key decryption failure (invalid master key) |
-| `503` | `DEPENDENCY_UNHEALTHY` | Core dependency (Database or Redis) connection failure |
+| `500` | `PERSISTENCE_FAILED` | Failed to atomically commit stream completion and assistant message to database |
+| `503` | `DEPENDENCY_UNHEALTHY` | Database connection failure (hard service outage) |
+| `503` | `SERVICE_DEGRADED` | Ephemeral feature temporarily unavailable due to Redis downtime |
 
 ### 2.8 Rate Limiting & Concurrency (`429` — Platform Ops & Guardrails)
 | HTTP Status | Error Code | Description |
