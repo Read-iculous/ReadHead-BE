@@ -86,24 +86,25 @@ User-level configuration, accessibility profile, proactive assistance, and priva
 
 #### Privacy Mode Storage Matrix (`privacy_mode_enabled = TRUE`)
 - **`reading_history`**: Strictly blocked (zero rows written; no URLs, titles, or dwell time saved).
-- **`conversations`**: Ephemeral in-session chat only (`page_url = NULL`); not persisted across browser restarts.
+- **`conversations` & `messages`**: Ephemeral in-session chat only (`page_url = NULL`); retained strictly in client memory (RAM/sessionStorage) and never written to PostgreSQL.
 - **`highlights`**: Preserved only if user explicitly clicks "Save Highlight" (explicit user intent).
-- **`quiz_records`**: Quizzes may be generated and evaluated interactively, but no score history is written to DB.
+- **`quiz_records`**: Quizzes are generated and cached temporarily in Redis (`ephemeral_quiz:{quiz_id}` with 30m TTL) for interactive grading, never written to `quiz_records` table.
 - **Existing Historical Data**: Unaltered (enabling Privacy Mode does not delete past history).
 
 ### 2.6 `conversations` (Feature I & D)
-Chat sessions tied to specific reading contexts. Tab-isolated.
+Chat sessions tied to specific reading contexts. Tab-isolated via `reading_session_id`.
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
+| `reading_session_id` | `UUID` | YES | NULL | Active reading session/tab UUID (NULL when opened from Dashboard) |
 | `title` | `VARCHAR(255)` | NO | `'New Conversation'` | Title / summary of conversation |
 | `page_url` | `TEXT` | YES | NULL | Web page URL where conversation started |
 | `page_title` | `VARCHAR(500)` | YES | NULL | Document / page title |
 | `version` | `INTEGER` | NO | `1` | Sync version (Feature J) |
-| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag |
+| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag (tombstone for sync, purged after 30 days) |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Session start |
-| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last message timestamp |
+| `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last update / message timestamp |
 
 ### 2.7 `messages` (Feature E — AI Reading Assistance)
 Individual turns in a conversation with source grounding metadata.
@@ -175,5 +176,14 @@ User ratings and error reports on AI responses.
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Feedback timestamp |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last updated timestamp |
 *(Unique Constraint: `[user_id, message_id]`. Duplicate submissions atomically update the existing record).*
-| `comment` | `TEXT` | YES | NULL | Optional user explanation |
-| `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Feedback timestamp |
+
+---
+
+## 3. High-Volume Composite Indexes
+| Index Name | Table | Columns | Purpose |
+|---|---|---|---|
+| `idx_conversations_user_updated` | `conversations` | `(user_id, is_deleted, updated_at DESC)` | High-speed retrieval of user chat sessions without full-table scans |
+| `idx_messages_conversation_created` | `messages` | `(conversation_id, created_at ASC)` | Fast chronological retrieval of messages in a conversation thread |
+| `idx_highlights_user_url` | `highlights` | `(user_id, page_url)` | Page-specific highlight lookups for extension in-page renderer |
+| `idx_user_api_keys_active` | `user_api_keys` | `(user_id, provider, is_active)` | Sub-millisecond active BYOK key lookup during AI stream dispatch |
+| `idx_reading_history_user_visited`| `reading_history` | `(user_id, visited_at DESC)` | History pagination and recent reading lookups |

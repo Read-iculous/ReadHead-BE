@@ -19,7 +19,7 @@
 |---|---|---|
 | **JWT Tokens** | `python-jose[cryptography]` / `PyJWT` | Encoding and decoding access/refresh tokens |
 | **Password Hashing** | `passlib[bcrypt]` | Secure salted bcrypt hashing for email/pass auth |
-| **Key Vault Encryption** | `cryptography` (Fernet / AES-256-GCM) | Symmetric encryption of user-provided LLM API keys |
+| **Key Vault Encryption** | `cryptography` (AES-256-GCM) | Symmetric encryption of user-provided LLM API keys |
 | **OAuth2 Clients** | `httpx` + `authlib` | Google & GitHub OAuth2 token exchange and profile fetch |
 
 ## 3. External AI Integration

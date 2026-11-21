@@ -32,6 +32,8 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 |---|---|---|
 | `422` | `VALIDATION_ERROR` | Pydantic schema validation failure |
 | `400` | `INVALID_JSON` | Malformed JSON request body |
+| `400` | `CANNOT_MODIFY_SELF_STATUS` | Administrators cannot suspend, ban, or alter their own account status |
+| `400` | `QUIZ_ALREADY_SUBMITTED` | Quiz has already been submitted and graded |
 | `409` | `EMAIL_ALREADY_EXISTS` | Registration email already registered |
 
 ### 2.3 Not Found (`404`)

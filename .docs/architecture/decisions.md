@@ -20,13 +20,15 @@
 
 ---
 
-## ADR-003: Symmetric AES-256-GCM Encryption for User API Keys
+## ADR-003: Symmetric AES-256-GCM Encryption with Keyring Support
 - **Status**: Accepted
-- **Context**: The backend needs to decrypt user API keys to make upstream calls on their behalf, so one-way hashing (like bcrypt) cannot be used.
-- **Decision**: Store API keys encrypted using **AES-256-GCM** (Authenticated Encryption with Associated Data). Ciphertext is stored as `v1:<base64_nonce>:<base64_ciphertext>:<base64_auth_tag>` with a secret master key stored strictly in environment variables (`ENCRYPTION_MASTER_KEY`). Fernet and CBC modes are explicitly eliminated.
+- **Context**: The backend needs to decrypt user API keys to make upstream calls on their behalf, so one-way hashing (like bcrypt) cannot be used. Key rotation must not cause downtime, and nonce reuse in GCM mode is catastrophic.
+- **Decision**: Store API keys encrypted using **AES-256-GCM** (Authenticated Encryption with Associated Data). Ciphertext is stored as `<version>:<base64_nonce>:<base64_ciphertext>:<base64_auth_tag>` (e.g. `v1:...`, `v2:...`). 
+  1. **Strict Nonce Isolation**: Every encryption call MUST generate a cryptographically secure random 12-byte Nonce via `secrets.token_bytes(12)`. Static or predictable nonces are strictly prohibited to prevent GCM Nonce Reuse attacks.
+  2. **Keyring Support**: The application supports a Keyring dictionary (`ENCRYPTION_MASTER_KEYS={"v1":"...", "v2":"..."}`) allowing running workers to decrypt both old and new versions concurrently, while new writes always use `CURRENT_KEY_VERSION`. Fernet and CBC modes are explicitly eliminated.
 - **Consequences**:
-  - *Pros*: Strong cryptographic security at rest with authentication tag verification preventing ciphertext tampering. Key version prefix (`v1:`) facilitates future zero-downtime key rotation.
-  - *Cons*: Key rotation requires an operational script to re-encrypt existing keys.
+  - *Pros*: Strong cryptographic security at rest with authentication tag verification preventing ciphertext tampering. Dual-key keyring enables 100% zero-downtime key rotation.
+  - *Cons*: Keyring rotation requires keeping the old key in configuration until the background migration re-encrypts all database records.
 
 ---
 
@@ -61,10 +63,17 @@
 
 ## ADR-007: Optimistic Concurrency Control for Multi-Device Sync (Feature J)
 - **Status**: Accepted
-- **Context**: Users can read on multiple machines (e.g. laptop and desktop). Concurrent edits to conversations or settings could cause silent data loss if "last-write-wins" is used naively.
-- **Decision**: Introduce integer `version` columns on synchronized records. If a sync push contains a base version lower than the server's current version, the server raises a `SYNC_CONFLICT` error with both versions instead of silently overwriting.
+- **Context**: Users can read on multiple machines (e.g. laptop and desktop). Concurrent edits to conversations or settings could cause silent data loss if "last-write-wins" or race-prone `SELECT...UPDATE` is used naively.
+- **Decision**: Introduce integer `version` columns on synchronized records. Sync mutations execute an **Atomic Conditional SQL Update**:
+  ```sql
+  UPDATE conversations 
+  SET title = :title, version = version + 1, updated_at = NOW() 
+  WHERE id = :id AND version = :base_version
+  RETURNING id;
+  ```
+  If affected rows == 0, the server immediately raises a `409 SYNC_CONFLICT` error with both versions, strictly preventing silent data loss without requiring table-level locks.
 - **Consequences**:
-  - *Pros*: Strictly complies with `FR-SYN-05` ("System SHALL NOT silently overwrite preserved data").
+  - *Pros*: Strictly complies with `FR-SYN-05` ("System SHALL NOT silently overwrite preserved data") and eliminates multi-thread race conditions.
   - *Cons*: Requires client UI to prompt the user or apply deterministic merge rules when conflicts arise.
 
 ---
@@ -91,11 +100,15 @@
 
 ## ADR-010: Real-Time Session Invalidation & Token Revocation via Redis
 - **Status**: Accepted
-- **Context**: Access Tokens have a 60-minute lifetime. When an admin bans an account or a user performs account deletion, waiting up to 60 minutes for JWT expiration creates an unauthorized access vulnerability.
-- **Decision**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check on every authenticated request and rejects revoked users immediately with `401 USER_SUSPENDED` or `401 UNAUTHORIZED`.
+- **Context**: Access Tokens have a 60-minute lifetime. When an admin bans an account or a user performs account deletion, waiting up to 60 minutes for JWT expiration creates an unauthorized access vulnerability. Active in-flight AI streams must also be aborted.
+- **Decision**:
+  1. **New Requests**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check on every authenticated request and rejects revoked users immediately with `401 USER_SUSPENDED` or `401 UNAUTHORIZED`.
+  2. **Active Streams**: Running SSE async generators inspect user revocation status between yielded tokens. Upon detecting a revocation event, the generator immediately yields an `event: error` (`USER_SUSPENDED`) and closes the connection.
+  3. **Reactivation**: When an admin reactivates an account, the backend updates PostgreSQL `users.status = 'active'` and deletes `revoked_users:{user_id}` from Redis.
+  4. **Fail-Safe High Availability**: If Redis experiences transient downtime or connection errors, the `get_current_user` dependency catches `RedisError` and gracefully falls back to checking `users.status` directly against PostgreSQL, guaranteeing zero downtime or 500 error cascades.
 - **Consequences**:
-  - *Pros*: Instantaneous cross-device session termination upon administrative action or account deletion.
-  - *Cons*: Introduces sub-millisecond Redis query to authenticated request pipeline.
+  - *Pros*: Instantaneous cross-device session termination for new requests and active streams upon administrative action or account deletion.
+  - *Cons*: Adds sub-millisecond Redis check to request pipeline and generator loop.
 
 ---
 
@@ -109,3 +122,37 @@
 - **Consequences**:
   - *Pros*: Protects server capacity, honors zero-document retention privacy, and hardens LLM against adversarial page injections.
   - *Cons*: Extension must bundle `pdf.js` worker and enforce 100 KB text truncation.
+
+---
+
+## ADR-012: Reading Session Identification & Ephemeral Privacy Mode Mechanics
+- **Status**: Accepted
+- **Context**: Relying purely on `page_url` fails tab isolation when multiple tabs open the same URL or when Privacy Mode sets `page_url = NULL`. Privacy Mode persistence exceptions (e.g. quiz evaluation, stream interruption) were underspecified.
+- **Decision**:
+  1. **Session Identification**: The browser extension assigns a unique `reading_session_id` (UUIDv4) stored in tab memory (`sessionStorage`) for each reading tab. Binds with backend `conversations.reading_session_id`. `TAB_CONTEXT_MISMATCH` is returned if an active conversation is hijacked by another tab without an explicit bind.
+  2. **Ephemeral Chat**: In Privacy Mode, chat messages are retained strictly in client memory (RAM/sessionStorage) and discarded when the tab closes. Zero rows are written to `conversations` or `messages` in PostgreSQL, even upon SSE stream disconnection.
+  3. **Ephemeral Quiz**: Quizzes generated in Privacy Mode are stored in Redis (`ephemeral_quiz:{quiz_id}`) with a 30-minute TTL for interactive submission and grading, completely bypassing the persistent `quiz_records` database table.
+- **Consequences**:
+  - *Pros*: Guarantees rock-solid tab isolation and true zero-storage privacy compliance while preserving interactive quiz capability.
+
+---
+
+## ADR-013: Composite Cursor Pagination for Multi-Device Synchronization
+- **Status**: Accepted
+- **Context**: Slicing incremental sync updates purely by timestamp (`updated_at > cursor`) causes skipped records when multiple rows share the same millisecond timestamp and exceed `limit`.
+- **Decision**: Standardize `POST /api/v1/sync/pull` on a **Composite Cursor** combining timestamp and unique primary key: `(updated_at, id)`. The cursor is passed as a Base64-encoded JSON string `{"t": "ISO_timestamp", "id": "uuid"}`. Slicing uses `WHERE (updated_at > :t) OR (updated_at = :t AND id > :id) ORDER BY updated_at ASC, id ASC LIMIT :limit`.
+- **Consequences**:
+  - *Pros*: Mathematically guarantees complete, non-repeating pagination across arbitrarily large batch updates.
+
+---
+
+## ADR-014: Database Session Lifecycle Decoupling for Long-Lived SSE Connections
+- **Status**: Accepted
+- **Context**: In FastAPI, standard dependency injection (`Depends(get_db)`) retains an open SQLAlchemy `AsyncSession` across the entire HTTP request lifecycle. For long-lived SSE connections (which can stream tokens for 15–45 seconds), keeping an active connection checked out from the connection pool (`pool_size = 5~10`) leads to rapid database connection exhaustion and starvation for ordinary transactional endpoints.
+- **Decision**: Decouple the database session lifecycle in `POST /api/v1/ai/stream` into three isolated phases:
+  1. **Phase 1 (Pre-stream DB Read)**: In a transient database session context, validate user credentials, load and decrypt the BYOK API key, verify conversation ownership and `reading_session_id`, and check domain blacklists. The database session is explicitly committed/closed and returned to the connection pool *before* entering the streaming loop.
+  2. **Phase 2 (Streaming Loop - Zero DB Connection)**: Stream tokens from the upstream LLM adapter via Server-Sent Events. Token processing, citation parsing, Redis rate-limiting/cancellation checks occur with zero database connections held.
+  3. **Phase 3 (Post-stream DB Write)**: Upon stream completion (`event: done`) or client disconnect, check out a fresh, transient database session to atomically insert the assistant message, update `conversation.updated_at` and increment `version`. The session is closed immediately after the write. In Privacy Mode, this phase is skipped entirely.
+- **Consequences**:
+  - *Pros*: Completely eliminates connection pool starvation. Hundreds of concurrent SSE streams can run concurrently with a modest database pool (`pool_size = 10`).
+  - *Cons*: Requires managing two brief explicit database context manager scopes instead of relying on a single request-scoped `Depends(get_db)`.

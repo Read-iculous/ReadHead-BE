@@ -33,9 +33,11 @@ app/
 ### Dependency Injection
 ```python
 # Always use Depends() for DB session and auth
+from uuid import UUID
+
 @router.get("/{user_id}")
 async def get_user(
-    user_id: int,
+    user_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -51,19 +53,20 @@ router = APIRouter(
 )
 ```
 
-### Settings with Pydantic
+### Settings with Pydantic (v2)
 ```python
 # app/core/config.py
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str
-    secret_key: str
+    redis_url: str
+    jwt_secret_key: str
+    encryption_master_key: str
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = 30
+    access_token_expire_minutes: int = 15
 
-    class Config:
-        env_file = ".env"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
 ```
@@ -90,16 +93,19 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 ## SQLAlchemy Conventions
 ```python
 # Models inherit from a shared Base
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, DateTime, ForeignKey, func
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=func.now(), nullable=False)
 ```
 
 ## Alembic (Migrations)
@@ -132,8 +138,11 @@ uvicorn[standard]
 sqlalchemy[asyncio]
 alembic
 asyncpg               # PostgreSQL async driver
-pydantic-settings
+redis                 # Async Redis 7+ client
+slowapi               # Rate limiting middleware
+pydantic-settings     # Settings management (v2)
 python-jose[cryptography]  # JWT
+cryptography          # AES-256-GCM symmetric encryption
 passlib[bcrypt]       # Password hashing
 pytest
 pytest-asyncio

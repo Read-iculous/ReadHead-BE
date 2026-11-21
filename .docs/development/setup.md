@@ -33,23 +33,37 @@ Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
 ```
-Generate an AES-256 master key for `ENCRYPTION_MASTER_KEY`:
+Generate an AES-256-GCM master key for `ENCRYPTION_MASTER_KEY`:
 ```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
 ```
-Paste the generated string into your `.env` file along with your local PostgreSQL credentials.
+Paste the generated string into your `.env` file along with your local PostgreSQL and Redis credentials.
 
-### Step 2.4: Prepare Database & Run Migrations
-Create the PostgreSQL database (e.g. `readhead_db`):
-```sql
-CREATE DATABASE readhead_db;
+### Step 2.4: Prepare Database & Redis Services
+Start PostgreSQL 15 and Redis 7 in one command via Docker Compose:
+```bash
+docker compose up -d
 ```
-Apply migrations via Alembic:
+Verify containers are healthy:
+```bash
+docker compose ps
+```
+Apply database migrations via Alembic:
 ```bash
 alembic upgrade head
 ```
 
-### Step 2.5: Start the Development Server
+*(Alternative without Docker)*:
+- PostgreSQL: `CREATE DATABASE readhead_db;`
+- Redis: `sudo systemctl start redis-server` (or local Windows Redis service)
+
+### Step 2.5: Bootstrap Initial Super Admin (Optional for Admin Portal)
+Create the initial administrator account:
+```bash
+python -m app.cli.create_admin --email admin@readhead.io --password "SecureAdminPassword123!"
+```
+
+### Step 2.6: Start the Development Server
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
