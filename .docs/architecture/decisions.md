@@ -143,3 +143,16 @@
 - **Decision**: Standardize `POST /api/v1/sync/pull` on a **Composite Cursor** combining timestamp and unique primary key: `(updated_at, id)`. The cursor is passed as a Base64-encoded JSON string `{"t": "ISO_timestamp", "id": "uuid"}`. Slicing uses `WHERE (updated_at > :t) OR (updated_at = :t AND id > :id) ORDER BY updated_at ASC, id ASC LIMIT :limit`.
 - **Consequences**:
   - *Pros*: Mathematically guarantees complete, non-repeating pagination across arbitrarily large batch updates.
+
+---
+
+## ADR-014: Database Session Lifecycle Decoupling for Long-Lived SSE Connections
+- **Status**: Accepted
+- **Context**: In FastAPI, standard dependency injection (`Depends(get_db)`) retains an open SQLAlchemy `AsyncSession` across the entire HTTP request lifecycle. For long-lived SSE connections (which can stream tokens for 15–45 seconds), keeping an active connection checked out from the connection pool (`pool_size = 5~10`) leads to rapid database connection exhaustion and starvation for ordinary transactional endpoints.
+- **Decision**: Decouple the database session lifecycle in `POST /api/v1/ai/stream` into three isolated phases:
+  1. **Phase 1 (Pre-stream DB Read)**: In a transient database session context, validate user credentials, load and decrypt the BYOK API key, verify conversation ownership and `reading_session_id`, and check domain blacklists. The database session is explicitly committed/closed and returned to the connection pool *before* entering the streaming loop.
+  2. **Phase 2 (Streaming Loop - Zero DB Connection)**: Stream tokens from the upstream LLM adapter via Server-Sent Events. Token processing, citation parsing, Redis rate-limiting/cancellation checks occur with zero database connections held.
+  3. **Phase 3 (Post-stream DB Write)**: Upon stream completion (`event: done`) or client disconnect, check out a fresh, transient database session to atomically insert the assistant message, update `conversation.updated_at` and increment `version`. The session is closed immediately after the write. In Privacy Mode, this phase is skipped entirely.
+- **Consequences**:
+  - *Pros*: Completely eliminates connection pool starvation. Hundreds of concurrent SSE streams can run concurrently with a modest database pool (`pool_size = 10`).
+  - *Cons*: Requires managing two brief explicit database context manager scopes instead of relying on a single request-scoped `Depends(get_db)`.

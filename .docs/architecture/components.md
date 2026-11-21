@@ -10,6 +10,7 @@ app/
 │   ├── auth.py                # JWT creation, decode & FastAPI authentication dependencies
 │   ├── database.py            # Async engine, sessionmaker & Base declarative class
 │   ├── redis.py               # Async Redis connection pool & rate limiter configuration
+│   ├── logging.py             # Structured JSON logger with sensitive data masking
 │   ├── exceptions.py          # Standard domain exceptions and HTTP error handlers
 │   ├── privacy/               # Sensitive Data & Privacy Subsystem (Feature H)
 │   │   ├── pii_detector.py    # Regex & heuristic detection for credentials, keys, PII
@@ -115,3 +116,15 @@ app/
   1. **Authenticated Endpoints** (`/ai/stream`, `/sync/*`): Keyed by authenticated `user_id` to guarantee user-level rate isolation.
   2. **Public Auth Endpoints** (`/auth/login`, `/auth/register`): Keyed by client IP extracted from `X-Forwarded-For` via trusted proxy middleware (`uvicorn --proxy-headers`), preventing Reverse Proxy IP collations that could cause system-wide lockouts.
   3. **High-Availability Fallback**: If Redis becomes temporarily unreachable, limiter gracefully falls back to in-memory counters to prevent 500 errors.
+
+### 2.7 Database Session Lifecycle Decoupling for SSE Streaming (`app/services/ai_service.py`)
+- Solves database connection pool exhaustion across long-lived streaming requests (`ADR-014`):
+  1. **Pre-Stream Read**: Transient DB session checks out to validate credentials, retrieve and decrypt BYOK API key, verify `reading_session_id`, and check domain blacklist. The session is closed and released back to pool before stream dispatch.
+  2. **Zero-DB Streaming Loop**: Token yielding, prompt fencing, citation analysis, and Redis cancellation checks (`revoked_users:{user_id}`) run without holding any open database connection.
+  3. **Post-Stream Write**: Upon stream completion or disconnect, a brief scoped DB transaction commits the assistant message and updates `conversations.version` atomically. Skipped in Privacy Mode.
+
+### 2.8 Structured JSON Logging & Telemetry Redaction (`app/core/logging.py`)
+- Enforces cloud-native observability and strict privacy compliance (`FR-OPS-03`):
+  1. Outputs single-line JSON log events containing `timestamp`, `level`, `service`, `request_id`, `user_id` (hashed or masked), and `message`.
+  2. **PII & Credential Scrubbing**: Intercepts log records to automatically mask API keys, Authorization headers, passwords, and sensitive text payloads matching credential regexes (`[REDACTED]`).
+  3. Correlates logs with `X-Request-ID` middleware for distributed tracing across services.

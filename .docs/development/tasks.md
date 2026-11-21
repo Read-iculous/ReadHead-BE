@@ -59,10 +59,12 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `app/core/database.py`: Configure asynchronous engine `create_async_engine`, sessionmaker `AsyncSessionLocal`, and `get_db` dependency.
   - `app/core/redis.py`: Configure asynchronous Redis connection pool and ping utility.
   - `app/core/exceptions.py`: Define base `AppException` and exception handlers for standard JSON envelopes.
+  - `app/core/logging.py`: Implement structured JSON logger emitting single-line JSON with automatic secret and PII masking (`[REDACTED]`) and request correlation ID.
   - `app/routers/health.py`: Create `GET /api/v1/health` returning system status, latency checks for database and redis.
   - `app/main.py`: Assemble FastAPI instance, CORS middleware with `allow_origin_regex=r"^chrome-extension://[a-z0-9]+$"` to support credentials without wildcard failures, router mounting, and lifespan management.
 - **Acceptance Criteria**:
   - Server starts cleanly via `uvicorn app.main:app --port 8000`.
+  - Application logs emit single-line JSON format with sensitive credentials/tokens masked as `[REDACTED]` (`FR-OPS-03`).
   - `GET /api/v1/health` returns `200 OK` with JSON checks (`checks.database` and `checks.redis` reporting healthy status and latency).
   - Returns `503 Service Unavailable` if PostgreSQL or Redis connection fails.
   - CORS middleware accepts origins configured in `CORS_ORIGINS` and regex-matches Chrome Extension origins.
@@ -232,16 +234,17 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 ---
 
 ### [BE-09] Real-Time SSE AI Streaming Endpoint
-- **Feature Reference**: Feature E (`FR-AI-01~12`), `ADR-002`, `ADR-009`, `ADR-011`
-- **Description**: Implement the central `/api/v1/ai/stream` Server-Sent Events endpoint handling Explain, Summarize, Translate, Simplify (Accessibility), and Multi-turn Chat. Enforce prompt injection fencing, max 2 concurrent SSE streams per user, and zero-binary PDF text ingestion.
+- **Feature Reference**: Feature E (`FR-AI-01~12`), `ADR-002`, `ADR-009`, `ADR-011`, `ADR-014`
+- **Description**: Implement the central `/api/v1/ai/stream` Server-Sent Events endpoint handling Explain, Summarize, Translate, Simplify (Accessibility), and Multi-turn Chat. Enforce prompt injection fencing, max 2 concurrent SSE streams per user, zero-binary PDF text ingestion, and database session lifecycle decoupling (`ADR-014`).
 - **Plan & Codebase**:
-  - `app/schemas/ai.py`: `AiStreamRequest` (with task enum: `explain`, `summarize`, `translate`, `simplify`, `chat`; payload accepts `selected_text`, `page_content`, `content_type`, `user_prompt`, `bypass_protection`).
-  - `app/services/ai_service.py`: Orchestrate user key decryption, conversation history injection, prompt construction with XML fencing (`<untrusted_web_context>`, `<user_selected_text>`), and async chunk generation.
+  - `app/schemas/ai.py`: `AiStreamRequest` (with task enum: `explain`, `summarize`, `translate`, `simplify`, `chat`; optional `target_language: str`; payload accepts `selected_text`, `page_content`, `content_type`, `user_prompt`, `bypass_protection`).
+  - `app/services/ai_service.py`: Orchestrate user key decryption, conversation history injection, prompt construction with XML fencing (`<untrusted_web_context>`, `<user_selected_text>`), and async chunk generation. Decouple DB session into 3 phases: (1) Pre-stream read & key load, (2) Streaming loop with zero DB connections held, and (3) Post-stream brief atomic write.
   - `app/routers/ai.py`: Mount `POST /api/v1/ai/stream` using FastAPI's `StreamingResponse(media_type="text/event-stream")`. Check and enforce max 2 concurrent active SSE streams via Redis `active_streams:{user_id}` (`429 STREAM_CONCURRENCY_EXCEEDED`).
   - Implement client disconnect detection (`asyncio.CancelledError`) to abort upstream streams gracefully (`ISSUE-001`).
   - Enforce rule against silent automated AI retries (`ADR-009`).
 - **Acceptance Criteria**:
   - Returns `text/event-stream` with standard events `start`, `token`, `citation`, `done`, and `error`.
+  - Database connection is freed before entering the token generator loop, preventing connection pool starvation across long-lived SSE streams (`ADR-014`).
   - If user has no active key for the provider, returns `400 NO_ACTIVE_API_KEY` before starting stream.
   - If user already has 2 active streams, rejects 3rd request with `429 STREAM_CONCURRENCY_EXCEEDED`.
   - If upstream provider fails or runs out of quota, streams `event: error` and aborts stream without `event: done`.
@@ -301,6 +304,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `POST /quiz/generate` returns structured questions with 4 options each, storing the correct answer on the server.
   - Insufficient source text returns `422 UNREPRESENTATIVE_SOURCE` instead of hallucinating questions (`FR-CMP-04`).
   - `POST /quiz/{id}/submit` compares submitted answers against stored keys, returns score (e.g. 4/5) and explanations.
+  - Re-submitting an already graded quiz returns `400 QUIZ_ALREADY_SUBMITTED` (`BR-07`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_quiz_api.py -v`
   - Screenshot: Swagger UI execution of `/api/v1/quiz/generate` showing generated quiz questions.
@@ -333,11 +337,12 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
 - **Plan & Codebase**:
   - `app/schemas/reading.py`: `ReadingHistoryCreate`, `ReadingHistoryResponse`, `HighlightCreate`, `HighlightResponse`, `HighlightListResponse`.
   - `app/services/reading_service.py`: Record history (bypassed if privacy mode or blacklisted domain), save highlights, clear history.
-  - `app/routers/reading.py`: `POST /api/v1/reading/history`, `GET /api/v1/reading/history`, `DELETE /api/v1/reading/history`, `POST /api/v1/reading/highlights`, `GET /api/v1/reading/highlights`.
+  - `app/routers/reading.py`: `POST /api/v1/reading/history`, `GET /api/v1/reading/history`, `DELETE /api/v1/reading/history`, `POST /api/v1/reading/highlights`, `GET /api/v1/reading/highlights`, `DELETE /api/v1/reading/highlights/{id}`.
 - **Acceptance Criteria**:
   - If `privacy_mode_enabled: true` or URL is blacklisted, `POST /api/v1/reading/history` returns `200 OK` with `data: null` and message `"History logging skipped by privacy policy"` without writing to DB.
   - `GET /api/v1/reading/history` returns paginated reading logs with dwell time and cached summaries using query params `page` and `page_size`.
   - Dedicated endpoint `GET /api/v1/reading/highlights` lists highlights with pagination and `page_url` filter.
+  - `DELETE /api/v1/reading/highlights/{id}` soft-deletes a highlight (`is_deleted = TRUE`, `version = version + 1`, `updated_at = NOW()`), returns `204 No Content`, and preserves a sync tombstone for cross-device synchronization (`FR-HIS-06`).
   - `DELETE /api/v1/reading/history` clears browsing logs and atomically sets `conversations.page_url = NULL, conversations.page_title = NULL` to eliminate past browsing ghost footprints under GDPR (`FR-HIS-05`, `FR-HIS-07`).
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_reading_history_api.py -v`

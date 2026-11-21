@@ -40,23 +40,22 @@ python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32
 Paste the generated string into your `.env` file along with your local PostgreSQL and Redis credentials.
 
 ### Step 2.4: Prepare Database & Redis Services
-1. **PostgreSQL**: Create the database (e.g. `readhead_db`):
-```sql
-CREATE DATABASE readhead_db;
+Start PostgreSQL 15 and Redis 7 in one command via Docker Compose:
+```bash
+docker compose up -d
 ```
-Apply migrations via Alembic:
+Verify containers are healthy:
+```bash
+docker compose ps
+```
+Apply database migrations via Alembic:
 ```bash
 alembic upgrade head
 ```
 
-2. **Redis**: Ensure a Redis instance is running locally on port 6379:
-```bash
-# Using Docker:
-docker run -d --name readhead-redis -p 6379:6379 redis:7-alpine
-
-# Or using local system service (Ubuntu/Debian):
-sudo systemctl start redis-server
-```
+*(Alternative without Docker)*:
+- PostgreSQL: `CREATE DATABASE readhead_db;`
+- Redis: `sudo systemctl start redis-server` (or local Windows Redis service)
 
 ### Step 2.5: Bootstrap Initial Super Admin (Optional for Admin Portal)
 Create the initial administrator account:

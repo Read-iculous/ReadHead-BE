@@ -81,3 +81,21 @@ python -m app.cli.rotate_keys --old-version v1 --new-version v2
 # Purge soft-deleted tombstones older than 30 days (cascades to messages & feedback)
 python -m app.cli.purge_tombstones --days 30
 ```
+
+## 6. Docker & Infrastructure Services
+```bash
+# Start PostgreSQL 15 and Redis 7 in the background
+docker compose up -d
+
+# Check status and health of backend services
+docker compose ps
+
+# View logs from running containers
+docker compose logs -f
+
+# Stop services preserving database volumes
+docker compose down
+
+# Stop services and remove volumes (clean reset)
+docker compose down -v
+```

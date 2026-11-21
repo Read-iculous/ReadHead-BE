@@ -278,6 +278,7 @@ Base URL: `/api/v1`
   ```json
   {
     "task": "explain", // "explain" | "summarize" | "translate" | "simplify" | "chat"
+    "target_language": "vi", // Optional: ISO-639-1 code (e.g. "vi", "en", "ja", "fr") for task: "translate"
     "conversation_id": "uuid-optional",
     "reading_session_id": "uuid", // Required: Client tab/reading session UUID for tab isolation
     "tab_id": 101, // Tab isolation guarantee (FR-CNT-05)
@@ -403,6 +404,7 @@ Base URL: `/api/v1`
 
 ### 6.2 POST `/api/v1/quiz/{quiz_id}/submit`
 - **Description**: Submit user's selected answers for grading and receive explanations.
+- **Idempotency Guard**: Once submitted and graded, subsequent submissions for the same quiz attempt return `400 QUIZ_ALREADY_SUBMITTED` with message `"Quiz has already been submitted and graded"`.
 - **Auth**: Required
 - **Request Body**: `{"answers": {"1": 1, "2": 0, "3": 2}}`
 - **Response**: `200 OK`
@@ -530,6 +532,11 @@ Base URL: `/api/v1`
     }
   }
   ```
+
+### 7.9 DELETE `/api/v1/reading/highlights/{id}`
+- **Description**: Soft-delete a web highlight (`is_deleted = true`, `version = version + 1`, `updated_at = NOW()`), creating a sync tombstone propagated across devices via `sync/pull`.
+- **Auth**: Required (Must own the highlight; returns `404 HIGHLIGHT_NOT_FOUND` if not found or unowned)
+- **Response**: `204 No Content`
 
 ---
 
