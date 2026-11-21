@@ -35,9 +35,9 @@
 ## ADR-004: Dual JWT Token Architecture (Access + Refresh Tokens)
 - **Status**: Accepted
 - **Context**: Extension users expect long-lived sessions without having to re-authenticate daily, while security requires short-lived access tokens.
-- **Decision**: Issue short-lived Access Tokens (60 minutes) and longer-lived Refresh Tokens (30 days) with token rotation on refresh and a 30-second concurrency grace period. Database-backed token tracking allows immediate session revocation.
+- **Decision**: Issue short-lived Access Tokens (15 minutes) and longer-lived Refresh Tokens (30 days) with token rotation on refresh, atomic Redis distributed locking (`lock:refresh:{token_hash}`), and a 30-second concurrency grace period. Database-backed token tracking allows immediate session revocation.
 - **Consequences**:
-  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens are rotated and can be invalidated upon logout or suspicious activity.
+  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens are rotated safely across concurrent tabs without triggering false-positive reuse detection; sessions can be invalidated instantly upon logout or administrative action.
   - *Cons*: Extension needs token-refresh interceptors to handle 401s seamlessly.
 
 ---
@@ -98,17 +98,21 @@
 
 ---
 
-## ADR-010: Real-Time Session Invalidation & Token Revocation via Redis
+## ADR-010: Real-Time Session Invalidation, Redis Downtime & Degraded Mode
 - **Status**: Accepted
-- **Context**: Access Tokens have a 60-minute lifetime. When an admin bans an account or a user performs account deletion, waiting up to 60 minutes for JWT expiration creates an unauthorized access vulnerability. Active in-flight AI streams must also be aborted.
+- **Context**: Access Tokens have a 15-minute lifetime. When an admin bans an account or a user deletes their profile, waiting for JWT expiration creates a security risk. Conversely, if Redis experiences downtime, hard-failing readiness probes (503) causes Kubernetes/Ingress to kill routing, preventing built-in database fallbacks from executing.
 - **Decision**:
-  1. **New Requests**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check on every authenticated request and rejects revoked users immediately with `401 USER_SUSPENDED` or `401 UNAUTHORIZED`.
-  2. **Active Streams**: Running SSE async generators inspect user revocation status between yielded tokens. Upon detecting a revocation event, the generator immediately yields an `event: error` (`USER_SUSPENDED`) and closes the connection.
-  3. **Reactivation**: When an admin reactivates an account, the backend updates PostgreSQL `users.status = 'active'` and deletes `revoked_users:{user_id}` from Redis.
-  4. **Fail-Safe High Availability**: If Redis experiences transient downtime or connection errors, the `get_current_user` dependency catches `RedisError` and gracefully falls back to checking `users.status` directly against PostgreSQL, guaranteeing zero downtime or 500 error cascades.
+  1. **New Requests & Token Revocation**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check and rejects revoked users with `401 USER_SUSPENDED`.
+  2. **Active Streams**: Running SSE async generators inspect user revocation status between yielded tokens. Upon detecting a revocation event, the generator immediately yields an `event: error` (`USER_SUSPENDED`) and terminates the stream.
+  3. **Readiness Probe & Degraded Mode Policy**:
+     - PostgreSQL is a **hard dependency**: if DB is unreachable, `/api/v1/health` returns `503 Service Unavailable`.
+     - Redis is a **soft dependency with graceful degradation**: if Redis is unreachable while DB is healthy, `/api/v1/health` returns `200 OK` with status `"degraded"` (`{"status": "degraded", "checks": {"database": {"status": "healthy"}, "redis": {"status": "unhealthy"}}}`). This keeps pods in rotation while degrading non-critical features:
+       - *Auth*: Bypasses Grace Cache and checks revocation directly against PostgreSQL.
+       - *Rate Limiting*: Falls back to local in-memory sliding window or permits requests.
+       - *Streaming Concurrency*: Bypasses multi-stream restriction temporarily; active streams ignore Redis connection loss mid-stream and continue delivering tokens to completion.
+       - *Ephemeral Quizzes*: Returns `503 SERVICE_DEGRADED` as quizzes in Privacy Mode require caching.
 - **Consequences**:
-  - *Pros*: Instantaneous cross-device session termination for new requests and active streams upon administrative action or account deletion.
-  - *Cons*: Adds sub-millisecond Redis check to request pipeline and generator loop.
+  - *Pros*: Instantaneous session revocation in normal operation, while eliminating system-wide outages from transient Redis restarts.
 
 ---
 
@@ -117,7 +121,7 @@
 - **Context**: Unbounded long-lived SSE connections can exhaust backend workers. PDF document uploads can balloon server disk/RAM. Untrusted web page text can harbor prompt injection attacks against LLMs.
 - **Decision**:
   1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (`slowapi`) apply strictly to the initial HTTP handshake.
-  2. **Zero-Binary PDF Handling**: Browser extension extracts clean text locally using bundled Mozilla `pdf.js` (max 100 KB text extract); zero raw PDF binaries are uploaded to the backend.
+  2. **Zero-Binary PDF Handling**: Browser extension extracts clean text locally using bundled Mozilla `pdf.js` (max 102,400 bytes UTF-8 text extract); zero raw PDF binaries are uploaded to the backend.
   3. **Prompt Injection Fencing**: Backend wraps web-derived contexts in XML delimiter tags (`<untrusted_web_context>` and `<user_selected_text>`) with immutable system prompt instructions commanding the LLM to treat inner text purely as passive reference data.
 - **Consequences**:
   - *Pros*: Protects server capacity, honors zero-document retention privacy, and hardens LLM against adversarial page injections.
@@ -125,34 +129,67 @@
 
 ---
 
-## ADR-012: Reading Session Identification & Ephemeral Privacy Mode Mechanics
+## ADR-012: Reading Session Identification, Tab Bind Flow & Ephemeral Privacy Mode Contract
 - **Status**: Accepted
-- **Context**: Relying purely on `page_url` fails tab isolation when multiple tabs open the same URL or when Privacy Mode sets `page_url = NULL`. Privacy Mode persistence exceptions (e.g. quiz evaluation, stream interruption) were underspecified.
+- **Context**: Relying purely on `page_url` fails tab isolation when multiple tabs open the same URL or when reading history is cleared (`page_url = NULL`). Privacy Mode multi-turn chat lacked an explicit history transport contract and bind flow.
 - **Decision**:
-  1. **Session Identification**: The browser extension assigns a unique `reading_session_id` (UUIDv4) stored in tab memory (`sessionStorage`) for each reading tab. Binds with backend `conversations.reading_session_id`. `TAB_CONTEXT_MISMATCH` is returned if an active conversation is hijacked by another tab without an explicit bind.
-  2. **Ephemeral Chat**: In Privacy Mode, chat messages are retained strictly in client memory (RAM/sessionStorage) and discarded when the tab closes. Zero rows are written to `conversations` or `messages` in PostgreSQL, even upon SSE stream disconnection.
+  1. **Session Identification & Explicit Bind Flow**:
+     - Browser tabs generate a `reading_session_id` (UUIDv4) stored in tab `sessionStorage`.
+     - When opened from the dashboard or history list, `conversations.reading_session_id` defaults to `NULL` (unbound readonly mode).
+     - To interact with an existing conversation from an active tab, the client sends `POST /api/v1/ai/conversations/{id}/bind` passing its `reading_session_id`.
+     - If the conversation is currently streaming tokens in another tab, the bind request is rejected with `409 CONVERSATION_BUSY`.
+     - When history is cleared (`page_url IS NULL`), any tab can bind to the conversation and context checking against the original URL is bypassed.
+  2. **Privacy Mode Multi-turn Chat Contract**:
+     - In Privacy Mode (`privacy_mode_enabled: true`), zero conversation or message rows are written to PostgreSQL.
+     - The client maintains message history in tab memory (`sessionStorage`) and transmits previous turns via the optional `ephemeral_history` field in `POST /api/v1/ai/stream`.
+     - `ephemeral_history` is capped at a sliding window of max 10 messages (max 16KB UTF-8 payload), restricted to roles `user` and `assistant`.
+     - The backend applies standard PII inspection to `ephemeral_history` before passing it to LLM context, and purges all instances from memory once the stream terminates.
   3. **Ephemeral Quiz**: Quizzes generated in Privacy Mode are stored in Redis (`ephemeral_quiz:{quiz_id}`) with a 30-minute TTL for interactive submission and grading, completely bypassing the persistent `quiz_records` database table.
 - **Consequences**:
-  - *Pros*: Guarantees rock-solid tab isolation and true zero-storage privacy compliance while preserving interactive quiz capability.
+  - *Pros*: Robust tab isolation, safe multi-turn conversations in zero-retention mode, and clear ownership transfers across tabs.
 
 ---
 
-## ADR-013: Composite Cursor Pagination for Multi-Device Synchronization
+## ADR-013: Multi-Entity Sync Pagination & 30-Day Tombstone Expiration
 - **Status**: Accepted
-- **Context**: Slicing incremental sync updates purely by timestamp (`updated_at > cursor`) causes skipped records when multiple rows share the same millisecond timestamp and exceed `limit`.
-- **Decision**: Standardize `POST /api/v1/sync/pull` on a **Composite Cursor** combining timestamp and unique primary key: `(updated_at, id)`. The cursor is passed as a Base64-encoded JSON string `{"t": "ISO_timestamp", "id": "uuid"}`. Slicing uses `WHERE (updated_at > :t) OR (updated_at = :t AND id > :id) ORDER BY updated_at ASC, id ASC LIMIT :limit`.
+- **Context**: Synchronizing three distinct entity types (`conversations`, `highlights`, `settings`) through a single cursor created pagination ambiguity. Additionally, soft-deleted tombstones are purged after 30 days, creating a data desynchronization risk for devices offline for extended periods (> 30 days).
+- **Decision**:
+  1. **Multi-Entity Pagination**: Standardize `POST /api/v1/sync/pull` to return independent Composite Cursors per entity group:
+     ```json
+     "next_cursors": {
+       "conversations": "c_base64...",
+       "highlights": "h_base64...",
+       "settings": "s_base64..."
+     }
+     ```
+     Alternatively, batch slicing applies `limit` across a unified timestamp change stream ordered by `(updated_at, entity_type, entity_id)` ensuring deterministic pagination without missing updates during concurrent writes.
+  2. **30-Day Tombstone Expiry & Full Resync Mandate**:
+     - Database cleans up soft-deleted records (`is_deleted = TRUE`) older than 30 days.
+     - If an offline client attempts an incremental sync with a cursor older than 30 days (`cursor_timestamp < NOW() - INTERVAL '30 days'`), the backend rejects the pull with `410 CURSOR_EXPIRED` and payload `{"requires_full_sync": true}`.
+     - The client extension must wipe its local cache and perform a full initial resynchronization, preventing stale deleted records from persisting locally forever.
 - **Consequences**:
-  - *Pros*: Mathematically guarantees complete, non-repeating pagination across arbitrarily large batch updates.
+  - *Pros*: Guarantees data consistency across long-dormant devices and clear pagination semantics across multiple entity types.
 
 ---
 
-## ADR-014: Database Session Lifecycle Decoupling for Long-Lived SSE Connections
+## ADR-014: Database Session Lifecycle Decoupling & Post-Stream Write Order
 - **Status**: Accepted
-- **Context**: In FastAPI, standard dependency injection (`Depends(get_db)`) retains an open SQLAlchemy `AsyncSession` across the entire HTTP request lifecycle. For long-lived SSE connections (which can stream tokens for 15–45 seconds), keeping an active connection checked out from the connection pool (`pool_size = 5~10`) leads to rapid database connection exhaustion and starvation for ordinary transactional endpoints.
-- **Decision**: Decouple the database session lifecycle in `POST /api/v1/ai/stream` into three isolated phases:
-  1. **Phase 1 (Pre-stream DB Read)**: In a transient database session context, validate user credentials, load and decrypt the BYOK API key, verify conversation ownership and `reading_session_id`, and check domain blacklists. The database session is explicitly committed/closed and returned to the connection pool *before* entering the streaming loop.
-  2. **Phase 2 (Streaming Loop - Zero DB Connection)**: Stream tokens from the upstream LLM adapter via Server-Sent Events. Token processing, citation parsing, Redis rate-limiting/cancellation checks occur with zero database connections held.
-  3. **Phase 3 (Post-stream DB Write)**: Upon stream completion (`event: done`) or client disconnect, check out a fresh, transient database session to atomically insert the assistant message, update `conversation.updated_at` and increment `version`. The session is closed immediately after the write. In Privacy Mode, this phase is skipped entirely.
+- **Context**: SSE streams can take 15–45 seconds. Holding database connections across streaming exhausts pools. Furthermore, if `event: done` is dispatched to the client before the database transaction commits the assistant message, a database commit failure would cause the client to display success while the message is permanently lost on page reload.
+- **Decision**: Decouple the database session lifecycle into strictly ordered phases:
+  1. **Phase 1 (Pre-stream DB Transaction)**:
+     - Check out transient DB session.
+     - Authenticate user, decrypt BYOK key, verify tab session ownership.
+     - If standard mode: Create conversation (if new) and insert `user message` into `messages` table. Commit transaction and close DB session.
+  2. **Phase 2 (Streaming Loop - Zero DB Connection)**:
+     - Stream LLM tokens via SSE (`event: start`, `event: token`, `event: citation`).
+     - Inspect Redis cancellation flags without DB connection.
+  3. **Phase 3 (Post-stream DB Commit BEFORE Event Done)**:
+     - Stream generation finishes from LLM.
+     - Check out fresh transient DB session.
+     - Insert `assistant message`, increment `conversation.version = version + 1`, update `conversation.updated_at = NOW()`.
+     - Commit DB transaction.
+     - **Only after DB commit successfully finishes**, dispatch `event: done` to client.
+     - **Failure Handling**: If the database commit fails, do NOT send `event: done`. Instead, dispatch `event: error` with code `PERSISTENCE_FAILED`. The client keeps the assistant reply in local memory/UI and displays a retry persistence prompt.
+  4. **Privacy Mode**: Skip DB writes in Phase 1 and Phase 3 entirely; dispatch `event: done` immediately after LLM finishes streaming.
 - **Consequences**:
-  - *Pros*: Completely eliminates connection pool starvation. Hundreds of concurrent SSE streams can run concurrently with a modest database pool (`pool_size = 10`).
-  - *Cons*: Requires managing two brief explicit database context manager scopes instead of relying on a single request-scoped `Depends(get_db)`.
+  - *Pros*: Zero pool starvation, guaranteed message persistence before client receives success signal, clear error handling on storage failures.

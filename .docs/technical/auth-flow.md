@@ -7,7 +7,7 @@ ReadHead-BE supports three login methods:
 3. **GitHub OAuth2** (using OAuth authorization code exchange)
 
 All authentication paths culminate in issuing a standard JWT pair:
-- **Access Token**: Short-lived (60 mins), used in HTTP headers: `Authorization: Bearer <access_token>`.
+- **Access Token**: Short-lived (15 mins), used in HTTP headers: `Authorization: Bearer <access_token>`.
 - **Refresh Token**: Long-lived (30 days), stored in the database to allow revocation and silent session renewal.
 
 ## 2. Authentication Flows
@@ -55,26 +55,39 @@ Extension Client                                  ReadHead-BE
        |                                                |
        |----- POST /api/v1/auth/refresh (refresh_token) >|
        |                                                |-- 1. Verify JWT signature & expiration (PyJWT leeway=60s for clock drift)
-       |                                                |-- 2. Check Redis 30s Grace Period cache
-       |                                                |-- 3. Check DB revocation status:
-       |                                                |      - If already revoked: Token Reuse detected!
-       |                                                |        Revoke all user tokens & reject (401)
-       |                                                |-- 4. Rotate: issue new access & refresh tokens
-       |                                                |-- 5. Mark old token revoked in DB
-       |                                                |-- 6. Cache rotated pair in Redis (30s TTL)
+       |                                                |-- 2. Security Check: Check account status (revoked_users:{user_id} & DB user.status)
+       |                                                |      - If banned/suspended: Return 401 USER_SUSPENDED immediately
+       |                                                |-- 3. Acquire Distributed Lock (lock:refresh:{hash(token)}, TTL=5s)
+       |                                                |      - If Lock Acquired (Winner):
+       |                                                |        a. Check DB revocation status (if revoked -> Token Reuse Detected!)
+       |                                                |        b. Rotate: issue new access & refresh tokens
+       |                                                |        c. Commit DB transaction: mark old token revoked, save new token
+       |                                                |        d. Cache rotated pair in Redis: refresh_grace:{hash(token)} (30s TTL)
+       |                                                |        e. Release Distributed Lock
+       |                                                |      - If Lock Contended (Waiting concurrent request):
+       |                                                |        a. Wait for lock release (polling with 50ms backoff, max 2s)
+       |                                                |        b. Read from Redis Grace Cache: return cached pair immediately
        |<- 200 OK (new access_token, refresh_token) ----|
 ```
 
-#### 2.3.1 Multi-Tab Concurrency Grace Period (30 Seconds)
+#### 2.3.1 Multi-Tab Concurrency Grace Period & Distributed Locking
 When multiple browser tabs make concurrent refresh requests upon access token expiry:
-1. **Verification Order**:
-   - First, the JWT signature and expiration timestamp are validated. Expired tokens outside their valid lifetime immediately return `401 REFRESH_TOKEN_EXPIRED`.
-   - Next, Redis is checked for an active 30-second grace window mapping: `hash(old_refresh_token) -> new_token_pair`.
-   - If found in Redis, the new token pair is returned immediately without re-rotating or raising an error.
-   - If not found in Redis, the database `refresh_tokens` record is checked. If the token is already marked `is_revoked = TRUE`, this constitutes **Token Reuse Detection**: all active refresh tokens for the user account are immediately revoked, the Redis grace cache is purged, and `401 REFRESH_TOKEN_REVOKED` is returned.
-2. **Normal Rotation**:
-   - The first tab to arrive rotates the token: marks the old token `is_revoked = TRUE` in the DB, generates a new token pair, and writes `hash(old_refresh_token) -> new_token_pair` to Redis with a **30-second TTL**.
-   - Subsequent concurrent requests from other tabs within 30 seconds are safely served the cached new token pair.
+1. **Strict Verification Order**:
+   - **Step 1: Signature & Expiration**: The refresh JWT signature, issuer, and expiration are validated. Expired tokens outside valid lifetime immediately return `401 REFRESH_TOKEN_EXPIRED`.
+   - **Step 2: Account Status & Revocation Check**: The server inspects Redis key `revoked_users:{user_id}` and `users.status`. If the account is banned, suspended, or deleted, the request is immediately rejected with `401 USER_SUSPENDED`. **Cached tokens are never returned to suspended accounts.**
+   - **Step 3: Fast-Path Grace Cache Check**: If Redis holds an active grace mapping `refresh_grace:{hash(old_token)} -> new_token_pair`, the cached pair is returned immediately without touching the database.
+   - **Step 4: Atomic Distributed Lock (`lock:refresh:{hash(old_token)}`)**:
+     - If the cache misses, the request attempts to acquire a Redis distributed mutex `SET lock:refresh:{hash(old_token)} <req_id> NX EX 5`.
+     - **Winner Request**:
+       1. Verifies database record for `old_token`. If `is_revoked = TRUE`, this is a true **Token Reuse Attack**: immediately revoke all active refresh tokens for the user, purge any existing grace cache keys (`DEL refresh_grace:*`), and return `401 REFRESH_TOKEN_REVOKED`.
+       2. Issues new access token (15 mins) and new refresh token (30 days).
+       3. Commits database transaction: updates `old_token.is_revoked = TRUE` and inserts `new_token`.
+       4. Writes `refresh_grace:{hash(old_token)} -> new_token_pair` to Redis with a **30-second TTL**.
+       5. Releases the distributed lock.
+       6. *Redis Failure Handling*: If Redis is unavailable or writing to Redis fails after the DB has successfully committed, the server logs a warning and returns the newly generated token pair directly to the client (graceful degraded rotation).
+     - **Concurrent Sibling Request(s)**:
+       1. If lock acquisition fails because another tab is already rotating, the sibling tab waits for lock release with a short exponential backoff (polling every 50ms, max 2000ms).
+       2. Once released, it reads `refresh_grace:{hash(old_token)}` from Redis and receives the exact same token pair without executing duplicate rotation or triggering a false positive reuse detection.
 
 ### 2.4 Logout & Session Revocation
 ```
@@ -82,7 +95,7 @@ Extension Client                                  ReadHead-BE
        |                                                |
        |----- POST /api/v1/auth/logout (refresh_token) ->|
        |                                                |-- Mark refresh token as revoked in DB
-       |                                                |-- Purge token from Redis grace cache
+       |                                                |-- Invalidate Redis grace cache: DEL refresh_grace:{hash(token)}
        |<- 204 No Content ------------------------------|
 ```
 
@@ -90,8 +103,9 @@ Extension Client                                  ReadHead-BE
 - When an account is suspended or banned by an administrator (`PATCH /api/v1/admin/users/{id}/status`) or deleted by the user (`DELETE /api/v1/users/me`):
   1. The database sets `users.status = 'banned'` (or cascades deletion) and revokes all refresh tokens.
   2. Redis key `revoked_users:{user_id}` is written with TTL = 3600 seconds.
-  3. Every authenticated endpoint checks `revoked_users:{user_id}` via the auth dependency in sub-millisecond time. If present, requests fail with `401 USER_SUSPENDED`.
-  4. Active in-flight AI streaming generators (`POST /api/v1/ai/stream`) inspect the cancellation flag on each yielded chunk; upon detecting user revocation, the stream emits `event: error` (`USER_SUSPENDED`) and terminates the socket immediately.
+  3. All active Redis grace cache entries for the user's tokens are purged immediately (`DEL refresh_grace:{hash(token)}`).
+  4. Every authenticated endpoint checks `revoked_users:{user_id}` via the auth dependency in sub-millisecond time. If present, requests fail with `401 USER_SUSPENDED`.
+  5. Active in-flight AI streaming generators (`POST /api/v1/ai/stream`) inspect the cancellation flag on each yielded chunk; upon detecting user revocation, the stream emits `event: error` (`USER_SUSPENDED`) and terminates the socket immediately.
 
 ### 2.6 Multi-Account Isolation & Storage Purge (`FR-ACC-04`)
 To prevent cross-account data leakage on shared browser environments:

@@ -46,12 +46,15 @@ class <Resource>Response(<Resource>Base):
     class Config:
         from_attributes = True  # SQLAlchemy model → Pydantic
 
-class <Resource>ListResponse(BaseModel):
-    data: list[<Resource>Response]
+class <Resource>PaginationData(BaseModel):
+    items: list[<Resource>Response]
     total: int
     page: int
     page_size: int
     total_pages: int
+
+class <Resource>ListResponse(BaseModel):
+    data: <Resource>PaginationData
 ```
 
 ## Step 2: Create / Update the ORM Model
@@ -128,8 +131,15 @@ async def list_<resource>s(
     db: AsyncSession = Depends(get_db),
 ):
     items, total = await <resource>_service.list_<resource>s(page, page_size, db)
-    return {"data": items, "total": total, "page": page, "page_size": page_size,
-            "total_pages": math.ceil(total / page_size)}
+    return {
+        "data": {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": math.ceil(total / page_size),
+        }
+    }
 
 @router.get("/{<resource>_id}", response_model=<Resource>Response)
 async def get_<resource>(<resource>_id: int, db: AsyncSession = Depends(get_db)):

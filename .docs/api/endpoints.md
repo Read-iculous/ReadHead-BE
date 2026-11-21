@@ -17,22 +17,40 @@ Base URL: `/api/v1`
 
 ### 1.1 GET `/api/v1/health` (Readiness Probe)
 - **Description**: Container readiness probe checking database connectivity and Redis cache status (enforces 1.5s timeout on dependency pings to prevent cascading pod kill loops).
+- **Degraded Mode Policy**:
+  - PostgreSQL is a mandatory dependency: if down, returns `503 Service Unavailable` (`status: "unhealthy"`).
+  - Redis is a soft dependency with graceful degradation: if Redis is down while PostgreSQL is healthy, returns `200 OK` (`status: "degraded"`). This keeps the container eligible for routing while application fallbacks (in-memory rate limiting, direct DB token checks) take over.
 - **Auth**: Public
-- **Response**: `200 OK` (when all dependencies healthy) or `503 Service Unavailable` (when DB or Redis down)
-  ```json
-  {
-    "status": "healthy",
-    "environment": "development",
-    "version": "0.1.0",
-    "uptime_seconds": 3600,
-    "checks": {
-      "database": { "status": "healthy", "latency_ms": 1.2 },
-      "redis": { "status": "healthy", "latency_ms": 0.5 }
-    },
-    "timestamp": "2026-11-21T00:00:00Z"
-  }
-  ```
-- **Failure Example (503 Service Unavailable)**:
+- **Response**: `200 OK` (when healthy or in degraded mode) or `503 Service Unavailable` (when database is down)
+  - *Healthy Example (200 OK)*:
+    ```json
+    {
+      "status": "healthy",
+      "environment": "development",
+      "version": "0.1.0",
+      "uptime_seconds": 3600,
+      "checks": {
+        "database": { "status": "healthy", "latency_ms": 1.2 },
+        "redis": { "status": "healthy", "latency_ms": 0.5 }
+      },
+      "timestamp": "2026-11-21T00:00:00Z"
+    }
+    ```
+  - *Degraded Mode Example (200 OK)*:
+    ```json
+    {
+      "status": "degraded",
+      "environment": "development",
+      "version": "0.1.0",
+      "uptime_seconds": 3600,
+      "checks": {
+        "database": { "status": "healthy", "latency_ms": 1.5 },
+        "redis": { "status": "unhealthy", "error": "Connection refused" }
+      },
+      "timestamp": "2026-11-21T00:00:00Z"
+    }
+    ```
+- **Database Failure Example (503 Service Unavailable)**:
   ```json
   {
     "status": "unhealthy",
@@ -91,13 +109,13 @@ Base URL: `/api/v1`
       "access_token": "jwt...",
       "refresh_token": "jwt...",
       "token_type": "bearer",
-      "expires_in": 3600
+      "expires_in": 900
     }
   }
   ```
 
 ### 2.3 POST `/api/v1/auth/oauth/google`
-- **Description**: Login/Register via Google Identity ID Token. Enforces `email_verified == true`. Auto-links with existing email if previously registered via password. Rejects unverified email with `400 EMAIL_NOT_VERIFIED`.
+- **Description**: Login/Register via Google Identity ID Token. Enforces `email_verified == true`. Auto-links with existing email if previously registered via password. Rejects unverified email with `403 EMAIL_NOT_VERIFIED`.
 - **Auth**: Public
 - **Request Body**: `{"id_token": "google_jwt_identity_token"}`
 - **Response**: `200 OK`
@@ -107,7 +125,7 @@ Base URL: `/api/v1`
       "access_token": "jwt...",
       "refresh_token": "jwt...",
       "token_type": "bearer",
-      "expires_in": 3600
+      "expires_in": 900
     }
   }
   ```
@@ -123,17 +141,23 @@ Base URL: `/api/v1`
       "access_token": "jwt...",
       "refresh_token": "jwt...",
       "token_type": "bearer",
-      "expires_in": 3600
+      "expires_in": 900
     }
   }
   ```
 
 ### 2.5 POST `/api/v1/auth/refresh`
-- **Description**: Rotate refresh token and issue new token pair.
-  - **Check 1**: JWT expiration timestamp (`401 REFRESH_TOKEN_EXPIRED`).
-  - **Check 2**: Redis Grace Period cache (within 30s concurrent requests receive cached new token pair).
-  - **Check 3**: Database revocation status (if already revoked $\rightarrow$ `401 REFRESH_TOKEN_REVOKED`, triggers Token Reuse Detection and revokes all user sessions).
-  - **Check 4**: Database user status (if `banned`/`suspended` $\rightarrow$ `401 USER_SUSPENDED`).
+- **Description**: Rotate refresh token and issue new token pair using distributed lock and grace cache.
+  - **Check 1 (Signature & Expiration)**: Validates refresh JWT signature and expiration timestamp (`401 REFRESH_TOKEN_EXPIRED`).
+  - **Check 2 (Account Status — Strict Pre-Cache Check)**: Checks Redis key `revoked_users:{user_id}` and DB `user.status`. If account is banned or suspended, immediately returns `401 USER_SUSPENDED`. Cached tokens are never returned to suspended accounts.
+  - **Check 3 (Grace Period Cache)**: Checks Redis key `refresh_grace:{hash(token)}`. If found, returns the cached token pair immediately.
+  - **Check 4 (Distributed Lock & Atomic Rotation)**:
+    - Acquires Redis distributed mutex `lock:refresh:{hash(token)}` (TTL 5s). Concurrent requests wait on lock and read grace cache once released.
+    - Inspects DB `refresh_tokens.is_revoked`. If already revoked, triggers **Token Reuse Detection**: revokes all user sessions in DB, purges all user grace caches in Redis, and returns `401 REFRESH_TOKEN_REVOKED`.
+    - Generates new access token (15 mins) and refresh token (30 days).
+    - Commits DB transaction: marks old token revoked and inserts new refresh token.
+    - Caches rotated pair in Redis (`refresh_grace:{hash(token)}`, TTL 30s) and releases lock.
+    - *Redis Fault Tolerance*: If Redis fails after DB commit, returns the new token pair to the client without error.
 - **Auth**: Public
 - **Request Body**: `{"refresh_token": "jwt..."}`
 - **Response**: `200 OK`
@@ -143,13 +167,13 @@ Base URL: `/api/v1`
       "access_token": "jwt...",
       "refresh_token": "jwt...",
       "token_type": "bearer",
-      "expires_in": 3600
+      "expires_in": 900
     }
   }
   ```
 
 ### 2.6 POST `/api/v1/auth/logout`
-- **Description**: Revoke current refresh token in database and immediately purge associated Redis grace period cache.
+- **Description**: Revoke current refresh token in database and immediately purge associated Redis grace period cache (`DEL refresh_grace:{hash(token)}`).
 - **Auth**: Required
 - **Request Body**: `{"refresh_token": "jwt..."}`
 - **Response**: `204 No Content`
@@ -273,28 +297,36 @@ Base URL: `/api/v1`
 - **Description**: Unified Server-Sent Events stream for AI tasks (Explain, Summarize, Translate, Simplify, Chat).
 - **Auth**: Required
 - **Headers**: `Accept: text/event-stream`
-- **Tab Context & Isolation**: If `conversation_id` is supplied, the server validates that `page_url` matches the original context. If mismatched, returns `400 TAB_CONTEXT_MISMATCH`.
+- **Tab Context & Isolation**:
+  - If `conversation_id` is supplied, server verifies ownership.
+  - **Cleared History Exemption**: If `conversations.page_url IS NULL` (e.g. browsing history was anonymized via `DELETE /api/v1/reading/history`), URL matching is skipped, allowing the user to seamlessly resume the chat from their active tab.
+  - If `page_url` is present on the conversation, inbound `page_url` must match; otherwise returns `400 TAB_CONTEXT_MISMATCH`.
 - **Request Body**:
   ```json
   {
     "task": "explain", // "explain" | "summarize" | "translate" | "simplify" | "chat"
     "target_language": "vi", // Optional: ISO-639-1 code (e.g. "vi", "en", "ja", "fr") for task: "translate"
     "conversation_id": "uuid-optional",
-    "reading_session_id": "uuid", // Required: Client tab/reading session UUID for tab isolation
+    "reading_session_id": "uuid-optional", // Client tab/reading session UUID; null when initiated from Dashboard
     "tab_id": 101, // Tab isolation guarantee (FR-CNT-05)
     "page_url": "https://example.com/article",
     "page_title": "Example Article Title",
-    "selected_text": "Selected snippet to explain...", // Max 10,000 chars
-    "page_content": "Extracted clean text content of the article...", // Max 102,400 chars (100KB)
+    "selected_text": "Selected snippet to explain...", // Max 10,000 bytes UTF-8
+    "page_content": "Extracted clean text content of the article...", // Max 102,400 bytes UTF-8
     "content_type": "html_article", // "html_article" | "pdf_text"
-    "user_prompt": "Explain this concept in simple terms", // Max 2,000 chars
+    "user_prompt": "Explain this concept in simple terms", // Max 2,000 bytes UTF-8
     "provider": "gemini",
     "model": "gemini-1.5-flash",
-    "bypass_protection": false // Set true only if user confirmed override
+    "bypass_protection": false, // Set true only if user confirmed override
+    "ephemeral_history": [ // Optional: Multi-turn chat context exclusively for Privacy Mode (Max 10 messages, max 16KB UTF-8)
+      { "role": "user", "content": "Previous question..." },
+      { "role": "assistant", "content": "Previous answer..." }
+    ]
   }
   ```
-- **SSE Stream Output**:
-  - *Success Stream Sequence*:
+- **SSE Stream Output & Strict Execution Order**:
+  - *Phase 1 (Pre-Stream Storage)*: In standard mode, the server opens a transient DB transaction, creates the conversation record (if new), and inserts the incoming `user message`. It commits and releases the DB connection *before* contacting the upstream LLM. (In Privacy Mode, this step is skipped entirely).
+  - *Phase 2 (Active Streaming)*:
     ```text
     event: start
     data: {"conversation_id": "uuid", "message_id": "uuid"}
@@ -307,24 +339,21 @@ Base URL: `/api/v1`
 
     event: citation
     data: {"source_id": "p-14", "text_snippet": "Neural networks process data in layers", "is_grounded": true, "confidence": 0.95}
-
-    event: done
-    data: {"message_id": "uuid", "finish_reason": "stop", "total_tokens": 142, "provider": "gemini", "model": "gemini-1.5-flash", "is_grounded": true, "uncertainty_flag": false, "grounding_notes": "Grounding verified against page context p-14"}
     ```
-  - *Error Stream Sequence* (e.g. Quota exceeded or in-flight user suspension):
-    ```text
-    event: start
-    data: {"conversation_id": "uuid", "message_id": "uuid"}
-
-    event: token
-    data: {"content": "Partial response before...", "index": 0}
-
-    event: error
-    data: {"code": "UPSTREAM_QUOTA_EXCEEDED", "detail": "Your Gemini API quota has been exhausted. Check Google AI Studio."}
-    ```
+  - *Phase 3 (Post-Stream Persistence & Done Event)*:
+    1. LLM streaming concludes.
+    2. In standard mode, a fresh transient DB session is opened to insert the completed `assistant message` record and update `conversation.version = version + 1`, `conversation.updated_at = NOW()`.
+    3. The database transaction is committed.
+    4. **`event: done` is emitted ONLY AFTER database commit succeeds**:
+       ```text
+       event: done
+       data: {"message_id": "uuid", "finish_reason": "stop", "total_tokens": 142, "provider": "gemini", "model": "gemini-1.5-flash", "is_grounded": true, "uncertainty_flag": false, "grounding_notes": "Grounding verified against page context p-14"}
+       ```
+    5. *Persistence Failure Handling*: If DB commit fails, the server **never emits `event: done`**; it emits `event: error` with code `PERSISTENCE_FAILED` (`{"code": "PERSISTENCE_FAILED", "detail": "Failed to persist response to conversation history"}`) so the client keeps the text in local UI memory.
 - **Error, Suspension & Disconnect Handling**:
   - If an upstream error occurs, the stream emits `event: error` and closes immediately. **No `done` event is sent after `error`**.
   - **In-Flight Cancellation**: Async generator inspects Redis key `revoked_users:{user_id}` on each token iteration. If user is banned/deleted mid-stream, stream terminates with `event: error` (`USER_SUSPENDED`) immediately.
+  - **Redis Downtime mid-stream**: If Redis becomes unreachable during streaming, the generator logs a warning, skips in-flight cancellation checks, and delivers the stream to completion.
   - **Client Disconnect**:
     - *Standard Mode*: Partial tokens are saved to `messages` with `uncertainty_flag = true` and `grounding_notes = 'interrupted_by_client'`.
     - *Privacy Mode*: Ephemeral in-session chat only (RAM / `sessionStorage`). Zero rows are written to database `messages` even upon disconnect.
@@ -369,6 +398,30 @@ Base URL: `/api/v1`
   }
   ```
 - **Response**: `201 Created`
+
+### 5.5 POST `/api/v1/ai/conversations/{id}/bind` (Tab Rebind & Active Isolation)
+- **Description**: Explicitly binds an active browser tab's reading session to an existing conversation. Required when reopening a conversation from history or switching active tabs.
+- **Auth**: Required
+- **Request Body**:
+  ```json
+  {
+    "reading_session_id": "uuid",
+    "page_url": "https://example.com/article"
+  }
+  ```
+- **Response**: `200 OK`
+  ```json
+  {
+    "data": {
+      "conversation_id": "uuid",
+      "reading_session_id": "uuid",
+      "is_bound": true
+    }
+  }
+  ```
+- **Error Conditions**:
+  - `409 CONVERSATION_BUSY`: Conversation is currently in-flight streaming tokens in another tab.
+  - `400 TAB_CONTEXT_MISMATCH`: If conversation has an existing `page_url` and it does not match inbound `page_url` (except when `page_url` was cleared to `NULL`).
 
 ---
 
@@ -476,7 +529,14 @@ Base URL: `/api/v1`
 
 ### 7.6 DELETE `/api/v1/reading/history`
 - **Description**: Clear entire browsing/reading history for the account (`FR-HIS-05`). Does not delete account or API keys.
-- **GDPR Footprint Anonymization**: In addition to deleting all rows in `reading_history`, atomically executes `UPDATE conversations SET page_url = NULL, page_title = NULL WHERE user_id = :user_id` to purge all URL browsing footprints from past chat sessions while preserving message discussions.
+- **GDPR Footprint Anonymization & Sync Integrity**: In addition to deleting all rows in `reading_history`, atomically executes inside the same transaction:
+  ```sql
+  UPDATE conversations 
+  SET page_url = NULL, page_title = NULL, version = version + 1, updated_at = NOW() 
+  WHERE user_id = :user_id;
+  ```
+  - Incrementing `version` and updating `updated_at` guarantees other connected devices synchronize this anonymization immediately.
+  - Cleared conversations permit subsequent chat interactions from any tab without triggering `TAB_CONTEXT_MISMATCH`.
 - **Auth**: Required
 - **Response**: `204 No Content`
 
@@ -544,6 +604,21 @@ Base URL: `/api/v1`
 
 ### 8.1 POST `/api/v1/sync/pull`
 - **Description**: Pull changes updated on other devices since client's cursor. Uses a **Composite Cursor** `(updated_at, id)` to prevent skipping items when multiple records share the exact same timestamp. Includes soft-deleted records as tombstones. Messages are excluded (loaded on-demand).
+- **Tombstone Retention & Cursor Expiration (30 Days)**:
+  - Soft-deleted entities (`is_deleted = TRUE`) are kept as tombstones for 30 days before permanent physical deletion.
+  - If a device has been offline for $>30$ days and submits a `cursor` with timestamp older than 30 days, the server rejects the request with **`410 Gone`** (`code: CURSOR_EXPIRED`):
+    ```json
+    {
+      "code": "CURSOR_EXPIRED",
+      "detail": "Sync cursor expired (>30 days). Tombstones purged. Full resync required.",
+      "requires_full_sync": true
+    }
+    ```
+  - The client extension must wipe its local storage and execute a fresh initial pull (`cursor: null`).
+- **Multi-Entity Pagination Contract**:
+  - The `limit` parameter defines the **total maximum mutations** across all three entity sets (`conversations`, `highlights`, `settings`) returned in one page.
+  - Changes across all 3 entities are ordered deterministically by `(updated_at ASC, id ASC)`.
+  - The response returns `has_more` and `next_cursors` broken down by entity group as well as an aggregate `next_cursor` reflecting the newest mutation processed.
 - **Auth**: Required
 - **Request Body**:
   ```json
@@ -556,10 +631,47 @@ Base URL: `/api/v1`
   ```json
   {
     "data": {
-      "updated_conversations": [...],
-      "updated_highlights": [...],
-      "updated_settings": {...},
-      "next_cursor": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowNTowMC4wMDBaIiwiaWQiOiJmOGExOTdhMi0yYjVlIn0=",
+      "updated_conversations": [
+        {
+          "id": "c8a417df-1b4e-4b6e-a2b1-8b9f12345678",
+          "title": "Quantum Computing Notes",
+          "page_url": "https://example.com/quantum",
+          "page_title": "Intro to Quantum",
+          "version": 3,
+          "is_deleted": false,
+          "updated_at": "2026-11-21T00:02:00Z"
+        }
+      ],
+      "updated_highlights": [
+        {
+          "id": "h1a417df-1b4e-4b6e-a2b1-8b9f12345678",
+          "page_url": "https://example.com/quantum",
+          "highlighted_text": "Qubits exist in superposition",
+          "color": "yellow",
+          "version": 2,
+          "is_deleted": false,
+          "updated_at": "2026-11-21T00:03:00Z"
+        },
+        {
+          "id": "h2b528ef-2c5f-5c7f-b3c2-9c0f23456789",
+          "is_deleted": true,
+          "version": 4,
+          "updated_at": "2026-11-21T00:04:00Z"
+        }
+      ],
+      "updated_settings": {
+        "target_language": "vi",
+        "explanation_level": "advanced",
+        "version": 5,
+        "updated_at": "2026-11-21T00:04:30Z"
+      },
+      "next_cursor": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowNDozMC4wMDBaIiwiaWQiOiJzZXR0aW5ncyJ9",
+      "next_cursors": {
+        "conversations": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowMjowMC4wMDBaIiwiaWQiOiJjOGE0MTdkZi0xYjRlIn0=",
+        "highlights": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowNDowMC4wMDBaIiwiaWQiOiJoMmI1MjhlZi0yYzVmIn0=",
+        "settings": "eyJ0IjoiMjAyNi0xMS0yMVQwMDowNDozMC4wMDBaIiwiaWQiOiJzZXR0aW5ncyJ9"
+      },
+      "total_items_in_page": 4,
       "has_more": false
     }
   }
