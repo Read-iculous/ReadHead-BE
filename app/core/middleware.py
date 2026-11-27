@@ -12,7 +12,7 @@ from app.core import redis
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.core.limiter import enforce_rate
-from app.core.logging import request_id_context
+from app.core.logging import request_id_context, user_id_context
 from app.core.security import decode_token
 
 PUBLIC_AUTH_PATHS = frozenset(
@@ -74,6 +74,7 @@ class OperationalMiddleware:
 
         async def dispatch() -> None:
             """Keep early rate-limit responses inside correlation and telemetry."""
+            nonlocal user_token
             uid = None
             header = request.headers.get("authorization", "")
             if header.lower().startswith("bearer "):
@@ -81,10 +82,11 @@ class OperationalMiddleware:
                     uid = decode_token(header[7:], "access")["sub"]
                 except AppException:
                     pass
+            user_token = user_id_context.set(uid)
             if (
                 scope["method"] != "OPTIONS"
                 and path.startswith("/api/v1/")
-                and "/health" not in path
+                and not path.startswith("/api/v1/health")
             ):
                 group = (
                     "auth"
@@ -129,11 +131,17 @@ class OperationalMiddleware:
             await send(message)
 
         context_token = request_id_context.set(request_id)
+        user_token = None
         try:
             await dispatch()
         finally:
             request_id_context.reset(context_token)
-            if path.startswith("/api/v1/") and "/health" not in path:
+            if user_token is not None:
+                user_id_context.reset(user_token)
+            if (
+                path.startswith("/api/v1/")
+                and not path.startswith("/api/v1/health")
+            ):
                 try:
                     key = f"metrics:{int(time.time()//60)}"
                     async with redis.client.pipeline(transaction=True) as pipe:

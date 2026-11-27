@@ -1,5 +1,6 @@
 """Allowlisted structured logging without request bodies or raw exceptions."""
 
+import hashlib
 import json
 import logging
 from contextvars import ContextVar
@@ -8,6 +9,12 @@ from datetime import datetime, timezone
 from app.core.privacy.pii_detector import inspect
 
 request_id_context: ContextVar[str | None] = ContextVar("request_id", default=None)
+user_id_context: ContextVar[str | None] = ContextVar("user_id", default=None)
+
+
+def mask_user_id(value: str | None) -> str | None:
+    """Correlate a user without exposing its raw identifier in logs."""
+    return hashlib.sha256(value.encode()).hexdigest()[:16] if value else None
 
 
 class JsonFormatter(logging.Formatter):
@@ -22,6 +29,9 @@ class JsonFormatter(logging.Formatter):
                 service="readhead",
                 message=message[:500],
                 request_id=getattr(record, "request_id", request_id_context.get()),
+                user_id=mask_user_id(
+                    getattr(record, "user_id", None) or user_id_context.get()
+                ),
             ),
             ensure_ascii=False,
         )

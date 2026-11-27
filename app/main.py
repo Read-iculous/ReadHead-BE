@@ -101,6 +101,8 @@ async def validation_error(
     status, code, detail = 422, "VALIDATION_ERROR", "Request validation failed"
     if malformed:
         status, code, detail = 400, "INVALID_JSON", "Malformed JSON body"
+        # A byte offset is not a field name; the envelope requires null here.
+        selected = None
     else:
         mutation_error = next(
             (
@@ -132,7 +134,8 @@ async def validation_error(
                 "UNSUPPORTED_PROVIDER",
                 "Provider is not supported",
             )
-    field = ".".join(str(v) for v in selected["loc"][1:]) if selected else None
+    locations = selected["loc"][1:] if selected else ()
+    field = ".".join(str(v) for v in locations) if locations else None
     return JSONResponse(
         dict(
             detail=detail,
@@ -160,7 +163,11 @@ async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
             code=(
                 "INVALID_JSON"
                 if malformed_json
-                else "UNAUTHORIZED" if exc.status_code == 401 else "VALIDATION_ERROR"
+                else (
+                    "NOT_FOUND"
+                    if exc.status_code == 404
+                    else "UNAUTHORIZED" if exc.status_code == 401 else "VALIDATION_ERROR"
+                )
             ),
             field=None,
         ),

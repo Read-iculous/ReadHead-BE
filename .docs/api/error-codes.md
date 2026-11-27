@@ -42,6 +42,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 ### 2.3 Not Found (`404`)
 | HTTP Status | Error Code | Description |
 |---|---|---|
+| `404` | `NOT_FOUND` | Unmatched route (no endpoint registered at the requested path) |
 | `404` | `USER_NOT_FOUND` | User entity not found |
 | `404` | `API_KEY_NOT_FOUND` | No API key found for requested provider |
 | `404` | `CONVERSATION_NOT_FOUND` | Conversation session ID not found |

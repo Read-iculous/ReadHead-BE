@@ -173,6 +173,7 @@ async def test_invalid_json_bytes_have_json_error_and_cors(system, body):
     )
     assert response.status_code == 400
     assert response.json()["code"] == "INVALID_JSON"
+    assert response.json()["field"] is None
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert response.headers["x-request-id"]
     assert "email" not in response.text
