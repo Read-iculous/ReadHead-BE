@@ -238,3 +238,12 @@ Regression source: `tests/integration/test_text_email_domain_errors.py`. Before 
 - **Fix**: Recognize JSON decoding causes wrapped by FastAPI's HTTPException and return sanitized `400 INVALID_JSON`, retaining CORS and request correlation. Invalid UTF-8 and truncated JSON are exercised through the production ASGI stack.
 
 Regression source: `tests/integration/test_account_cache_url_refresh_errors.py`. All upstream HTTP is explicitly synthetic; PostgreSQL/Redis and application services are real. The initial long-URL fixture was one character too long and was corrected before final validation; that failed attempt is not counted as successful verification.
+
+### [ISSUE-038] Deployment-Layer Hardening Is Outside the Application Boundary
+- **Discovered**: 2026-11-27 (BE-01/BE-03 security review)
+- **Severity**: Low (deployment responsibility, not an application bug)
+- **Scenario**: Application-layer defences are verified — SQLAlchemy parameterization blocks SQL injection, Redis fixed-window limits block auth brute force/abuse, Pydantic `max_length` bounds every payload field, and JWT decoding pins a single HMAC algorithm. Two classes remain the reverse proxy's responsibility:
+  1. **Total request body size**: there is no ASGI middleware returning `413` before Starlette parses the whole body. Per-field bounds cap business processing, but a very large JSON body is still read in full. Configure `client_max_body_size` (nginx) or an equivalent edge limit.
+  2. **Network-layer DDoS** (SYN flood, volumetric traffic): the in-process/Redis application rate limiter cannot mitigate this. Use a CDN/WAF or infrastructure filtering.
+  3. **Client IP behind a proxy**: public auth rate limits use `request.client.host`; Uvicorn must be started with `--proxy-headers --forwarded-allow-ips=<trusted proxies>` (or equivalent) or every client shares one rate bucket. `Dockerfile` currently runs without that flag.
+- **Resolution**: Documented for deployment; no code change required for BE task acceptance. Regression evidence: 21-request login burst yielded `401` until the 20th request then `429`; SQLi payloads stayed literal strings with no DB effect; 20,000-character PII probe processed in ~1 ms.

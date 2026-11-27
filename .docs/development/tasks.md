@@ -126,7 +126,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Cover post-lock cache hits, lease expiry, DB-success/Redis-failure, logout of a successor while predecessor mappings remain, and Redis-unavailable DB rotation.
   - `POST /logout` revokes the whole authenticated session chain and all indexed grace mappings, including earlier tokens; stale caches cannot bypass DB session checks. Other device sessions remain active.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_auth_api.py -v`
+  - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_account_cache_url_refresh_errors.py tests/integration/test_concurrency_privacy_review.py tests/integration/test_send_disconnect_domain_password.py -v` (auth coverage is spread across these files; no `test_auth_api.py` exists)
   - Screenshot: Postman or Swagger UI showing `POST /api/v1/auth/login` returning tokens and subsequent authenticated call to `/api/v1/users/me` with Bearer header.
 
 ---
