@@ -47,8 +47,8 @@ pytest tests/unit/
 # Run integration tests only
 pytest tests/integration/
 
-# Run a single test file
-pytest tests/integration/test_auth_api.py -v
+# Run the auth-focused integration files (there is no test_auth_api.py)
+pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_account_cache_url_refresh_errors.py tests/integration/test_concurrency_privacy_review.py tests/integration/test_send_disconnect_domain_password.py -v
 ```
 
 ## 4. Code Quality, Formatting & Linting
