@@ -27,9 +27,22 @@ alembic current
 
 ---
 
-## 3. Migration Log (Planned Sequence)
+## 3. Migration Log
 
 | Revision ID | Description | Impacted Tables | Status |
 |---|---|---|---|
-| `0001_initial_schema` | Full initial schema across all 11 core tables (`users`, `oauth_accounts`, `refresh_tokens`, `user_api_keys`, `user_settings`, `conversations`, `messages`, `reading_history`, `highlights`, `quiz_records`, `ai_feedback`) including `role` and `status` columns. | All 11 tables | Planned |
-| `0002_add_domain_blacklist_gin_idx` | Add PostgreSQL GIN index on `user_settings.blacklisted_domains` for high-speed domain matching. | `user_settings` | Planned |
+| `0001_initial_schema` | Full initial schema across all 12 core tables (`users`, `oauth_accounts`, `auth_sessions`, `refresh_tokens`, `user_api_keys`, `user_settings`, `conversations`, `messages`, `reading_history`, `highlights`, `quiz_records`, `ai_feedback`) including session lifecycle/revocation fields, `users.sync_clock`, `role`, `status`, and sync indexes. | All 12 tables | Implemented; applied locally |
+| `0002_domain_blacklist` | Add PostgreSQL GIN index on `user_settings.blacklisted_domains` for high-speed domain matching. | `user_settings` | Implemented; applied locally |
+| `0003_highlight_url_digest` | Replace full URL index with bounded digest expression and exact URL filtering. | `highlights` | Upgrade/downgrade/upgrade verified on disposable PostgreSQL; apply to the project database with `alembic upgrade head` |
+
+Revisions are implemented in `alembic/versions/0001_initial_schema_create_all_twelve_tables.py` and `alembic/versions/0002_add_domain_blacklist_gin_idx.py`. Applied to the local project PostgreSQL instance on 2026-11-21; `alembic check` reports no metadata drift. The initial phase did not execute downgrade tests for these two revisions; the later `0003_highlight_url_digest` upgrade/downgrade verification is recorded below. Never edit an applied/shared revision to change schema; add a new revision instead.
+
+
+## 2026-11-21 — Bound highlight URL index entries
+
+- **Revision**: `0003_highlight_url_digest`, following `0002_domain_blacklist`.
+- **File**: `alembic/versions/0003_bound_highlight_url_index.py`.
+- **Change**: Replace `idx_highlights_user_url(user_id, page_url)` with `(user_id, md5(page_url))`. Highlight queries use digest equality plus full URL equality; stored URLs and ownership remain unchanged.
+- **Reason**: Valid URLs up to 8,192 characters can exceed PostgreSQL B-tree entry limits when indexed in full, producing a database error on save.
+- **Application**: Run `.venv/bin/alembic upgrade head` against the intended database before serving the updated application. Earlier revisions are unchanged.
+- **Rollback**: Downgrade restores the old full-URL index. Export/remove URLs that cannot fit the old index before rollback; otherwise PostgreSQL rejects index creation and the migration transaction rolls back. The automated runner exercises upgrade → downgrade → upgrade on disposable storage before application tests; it does not attempt to fit new long URLs into the old index.

@@ -24,6 +24,7 @@ Core user account registry.
 | `status` | `VARCHAR(20)` | NO | `'active'` | Account status: `'active'`, `'suspended'`, `'banned'` |
 | `is_active` | `BOOLEAN` | NO | `TRUE` | Whether account is active (syncs with status == 'active') |
 | `is_verified` | `BOOLEAN` | NO | `FALSE` | Email verification status |
+| `sync_clock` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Server-only monotonic sync timestamp allocator/checkpoint; see ADR-013 |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Account creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last profile update timestamp |
 
@@ -39,16 +40,22 @@ Linked third-party OAuth identities (Google, GitHub).
 *(Unique Constraint: `[provider, provider_user_id]`)*
 
 ### 2.3 `refresh_tokens` (Feature A)
-Tracks active sessions and refresh tokens for revocation and device tracking.
+Tracks refresh-token chains owned by `auth_sessions`; only SHA-256 token hashes are persisted.
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
-| `token_hash` | `VARCHAR(255)` | NO | — | SHA-256 hash of refresh token |
+| `session_id` | `UUID` | NO | — | FK -> `auth_sessions.id`; shared across rotation chain |
+| `token_hash` | `VARCHAR(255)` | NO | — | Unique SHA-256 hash of refresh token |
 | `device_info` | `VARCHAR(255)` | YES | NULL | Browser/OS user agent identifier |
 | `expires_at` | `TIMESTAMPTZ` | NO | — | Expiration timestamp |
-| `is_revoked` | `BOOLEAN` | NO | `FALSE` | Revocation status |
+| `is_revoked` | `BOOLEAN` | NO | `FALSE` | True after rotation, logout or a security event |
+| `revoked_at` | `TIMESTAMPTZ` | YES | NULL | Rotation/revocation time; required when revoked |
+| `revocation_reason` | `VARCHAR(20)` | YES | NULL | `rotated`, `logout`, `security`; required when revoked |
+| `replaced_by_token_id` | `UUID` | YES | NULL | Self FK -> `refresh_tokens.id` (ON DELETE SET NULL); populated on rotation |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Issued timestamp |
+
+*(Unique `token_hash`; composite FK `[session_id, user_id]` -> `auth_sessions[id, user_id]` with ON DELETE CASCADE. `is_revoked = FALSE` requires NULL revocation fields; `TRUE` requires both timestamp and reason. Replacement tokens must belong to the same session. Retain rotated rows at least through their token expiry plus clock leeway.)*
 
 ### 2.4 `user_api_keys` (Feature C — BYOK Vault)
 User-provided LLM provider API keys encrypted at rest via AES-256.
@@ -57,7 +64,7 @@ User-provided LLM provider API keys encrypted at rest via AES-256.
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
 | `provider` | `VARCHAR(50)` | NO | — | `openai`, `gemini`, `claude` |
-| `encrypted_key` | `TEXT` | NO | — | Symmetrically encrypted API key (AES-256-GCM format: `v1:<nonce>:<ciphertext>:<auth_tag>`) |
+| `encrypted_key` | `TEXT` | NO | — | Symmetrically encrypted API key (AES-256-GCM format: `<version>:<nonce>:<ciphertext>:<auth_tag>`) |
 | `key_hint` | `VARCHAR(20)` | NO | — | Masked preview (e.g. `sk-...4F8a`) |
 | `is_active` | `BOOLEAN` | NO | `TRUE` | Whether this key is currently selected |
 | `last_validated_at`| `TIMESTAMPTZ` | YES | NULL | Last successful ping check timestamp |
@@ -91,6 +98,8 @@ User-level configuration, accessibility profile, proactive assistance, and priva
 - **`quiz_records`**: Quizzes are generated and cached temporarily in Redis (`ephemeral_quiz:{quiz_id}` with 30m TTL) for interactive grading, never written to `quiz_records` table.
 - **Existing Historical Data**: Unaltered (enabling Privacy Mode does not delete past history).
 
+Privacy checks for content writes are made under the `users` row lock shared by settings PATCH/sync, not solely from an earlier request snapshot. SSE admission and final/partial persistence re-read settings after acquiring that lock. A private request never becomes persistent later; already committed content from before the toggle remains historical data. Automatic history and generated-quiz storage follow the same ordering.
+
 ### 2.6 `conversations` (Feature I & D)
 Chat sessions tied to specific reading contexts. Tab-isolated via `reading_session_id`.
 | Column | Type | Nullable | Default | Description |
@@ -102,7 +111,7 @@ Chat sessions tied to specific reading contexts. Tab-isolated via `reading_sessi
 | `page_url` | `TEXT` | YES | NULL | Web page URL where conversation started. Set to NULL upon reading history clearance or in Privacy Mode |
 | `page_title` | `VARCHAR(500)` | YES | NULL | Document / page title |
 | `version` | `INTEGER` | NO | `1` | Optimistic lock & sync version. Incremented on every message, title update, soft delete, or history clearance |
-| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag (tombstone for sync, purged after 30 days. Cursors >30 days trigger `410 CURSOR_EXPIRED`) |
+| `is_deleted` | `BOOLEAN` | NO | `FALSE` | Soft delete flag (tombstone retained at least 30 days; cursor retention anchors older than 30 days trigger `410 CURSOR_EXPIRED`) |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Session start |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last update / message / clearance timestamp |
 
@@ -179,11 +188,32 @@ User ratings and error reports on AI responses.
 
 ---
 
+### 2.12 `auth_sessions` (Feature A — Session Lifecycle)
+One login/OAuth session owns an entire refresh-token chain. It is distinct from tab reading sessions.
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `UUID` | NO | `gen_random_uuid()` | Session PK; JWT `sid` claim |
+| `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
+| `device_info` | `VARCHAR(255)` | YES | NULL | Device/browser metadata |
+| `expires_at` | `TIMESTAMPTZ` | NO | — | Initial refresh expiry; extended on successful rotation |
+| `revoked_at` | `TIMESTAMPTZ` | YES | NULL | NULL while session is active |
+| `revocation_reason` | `VARCHAR(20)` | YES | NULL | `logout` or `security`; set together with `revoked_at` |
+| `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Login/OAuth timestamp |
+*(Unique Constraint: `[id, user_id]` for the composite token ownership FK. Revocation reason and timestamp must both be NULL or both non-NULL.)*
+
+All authenticated requests validate session ownership, expiry and revocation in PostgreSQL. Grace-cache lookup is never a replacement for this check. See `.docs/technical/auth-flow.md` for locking, cleanup and temporary refresh failure behavior.
+
 ## 3. High-Volume Composite Indexes
+
+Synchronized creates/updates, soft deletes, message appends and history clearance allocate `updated_at` under the `users` row lock using the server-only `sync_clock` (ADR-013). Clients cannot set this field. Per-entity cursor indexes include `(user_id, updated_at, id)` without excluding tombstones.
 | Index Name | Table | Columns | Purpose |
 |---|---|---|---|
 | `idx_conversations_user_updated` | `conversations` | `(user_id, is_deleted, updated_at DESC)` | High-speed retrieval of user chat sessions without full-table scans |
 | `idx_messages_conversation_created` | `messages` | `(conversation_id, created_at ASC)` | Fast chronological retrieval of messages in a conversation thread |
-| `idx_highlights_user_url` | `highlights` | `(user_id, page_url)` | Page-specific highlight lookups for extension in-page renderer |
+| `idx_highlights_user_url` | `highlights` | `(user_id, md5(page_url))` B-tree expression | Bounded index entries for valid URLs up to 8,192 characters; lookups also compare the full URL to exclude digest collisions |
 | `idx_user_api_keys_active` | `user_api_keys` | `(user_id, provider, is_active)` | Sub-millisecond active BYOK key lookup during AI stream dispatch |
 | `idx_reading_history_user_visited`| `reading_history` | `(user_id, visited_at DESC)` | History pagination and recent reading lookups |
+| `idx_auth_sessions_user` | `auth_sessions` | `(user_id, revoked_at)` | Session validation and account-wide revocation |
+| `idx_refresh_tokens_session` | `refresh_tokens` | `(session_id)` | Chain revocation and cleanup |
+| `idx_conversations_sync` | `conversations` | `(user_id, updated_at, id)` | Unified sync including tombstones |
+| `idx_highlights_sync` | `highlights` | `(user_id, updated_at, id)` | Unified sync including tombstones |

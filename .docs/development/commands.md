@@ -99,3 +99,10 @@ docker compose down
 # Stop services and remove volumes (clean reset)
 docker compose down -v
 ```
+
+### Zero-Downtime Rotation Runbook
+1. Distribute `ENCRYPTION_MASTER_KEYS` containing both `v1` and `v2` to every API worker and maintenance process. Keep `CURRENT_KEY_VERSION=v1` until every process can decrypt both versions.
+2. Roll out `CURRENT_KEY_VERSION=v2` to **all writers** and confirm no old-version writer remains. Keep both keys available; existing `v1` records remain readable.
+3. Run `python -m app.cli.rotate_keys --old-version v1 --new-version v2`. Process bounded batches. Each update uses a compare-and-swap on record ID and the exact original ciphertext (`WHERE id = :id AND encrypted_key = :original_ciphertext`), so a concurrent user key replacement is never overwritten. Skip/re-read changed rows; resume safely after interruption. Cipher-only re-encryption does not change user-visible metadata.
+4. Verify every active writer still uses `v2`, no database row has a `v1:` prefix, and a second scan finds zero remaining `v1` rows. Only then remove `v1` from live keyrings. Retain old key material securely for the backup-restore retention policy; restoring an old backup requires its matching key.
+5. On migration failure keep the dual keyring and continue serving reads/writes with `v2`; resume migration. Never remove a key still referenced by a record. Rolling back a writer to `v1` invalidates the completion check and requires another migration scan.
