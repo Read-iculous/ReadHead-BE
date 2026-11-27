@@ -247,3 +247,12 @@ Regression source: `tests/integration/test_account_cache_url_refresh_errors.py`.
   2. **Network-layer DDoS** (SYN flood, volumetric traffic): the in-process/Redis application rate limiter cannot mitigate this. Use a CDN/WAF or infrastructure filtering.
   3. **Client IP behind a proxy**: public auth rate limits use `request.client.host`; Uvicorn must be started with `--proxy-headers --forwarded-allow-ips=<trusted proxies>` (or equivalent) or every client shares one rate bucket. `Dockerfile` currently runs without that flag.
 - **Resolution**: Documented for deployment; no code change required for BE task acceptance. Regression evidence: 21-request login burst yielded `401` until the 20th request then `429`; SQLi payloads stayed literal strings with no DB effect; 20,000-character PII probe processed in ~1 ms.
+
+### [ISSUE-039] Key Vault Hardening From Deep Review (Fixed)
+- **Discovered**: 2026-11-27 (BE-07 deep review)
+- **Severity**: Low
+- **Findings & Fixes**:
+  1. **Duplicate keyring material**: `ENCRYPTION_MASTER_KEYS` accepted the same key bytes under two version labels, making a rotation a silent no-op. Startup now rejects duplicate key material.
+  2. **Store/delete resurrection race**: `store()` validates upstream (up to 10 s) before an unconditional UPSERT; a concurrent `DELETE /api-keys/{provider}` could be resurrected by the late commit. Both writers now serialize through a Redis mutex `lock:apikey:{user_id}:{provider}`.
+  3. **Rotation abort on corrupt row**: `rotate_keys` aborted the entire migration when a single ciphertext failed decryption. It now logs `vault_rotation_skipped row=... reason=undecryptable`, excludes that row from subsequent batches, and continues; operators still must investigate skipped rows before removing the old key.
+- **Regression**: `tests/unit/test_security_vault.py` covers roundtrip + fresh nonce, bit-flip tamper rejection (`ENCRYPTION_ERROR` without leaking plaintext), wrong version label, duplicate keyring rejection, and rotation migrating only decryptable rows via the CAS predicate.
