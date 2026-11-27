@@ -6,6 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import redis
 from app.core.ai.factory import ProviderFactory
 from app.core.auth import Principal
 from app.core.database import transaction
@@ -76,28 +77,41 @@ async def store(principal: Principal, data: ApiKeyCreateRequest) -> dict:
         last_validated_at=now,
         updated_at=now,
     )
-    async with transaction() as db:
-        result = await db.execute(
-            insert(UserApiKey)
-            .values(user_id=principal.user_id, provider=data.provider, **values)
-            .on_conflict_do_update(index_elements=["user_id", "provider"], set_=values)
-            .returning(UserApiKey)
-        )
-        return {"data": public(result.scalar_one(), FIELDS)}
+    mutex = redis.Mutex(f"lock:apikey:{principal.user_id}:{data.provider}")
+    await mutex.acquire()
+    try:
+        async with transaction() as db:
+            result = await db.execute(
+                insert(UserApiKey)
+                .values(user_id=principal.user_id, provider=data.provider, **values)
+                .on_conflict_do_update(
+                    index_elements=["user_id", "provider"], set_=values
+                )
+                .returning(UserApiKey)
+            )
+            return {"data": public(result.scalar_one(), FIELDS)}
+    finally:
+        await mutex.release()
 
 
 async def remove(principal: Principal, provider: str) -> None:
     """Delete only this user's key for a provider."""
-    async with transaction() as db:
-        result = await db.execute(
-            delete(UserApiKey)
-            .where(
-                UserApiKey.user_id == principal.user_id, UserApiKey.provider == provider
+    mutex = redis.Mutex(f"lock:apikey:{principal.user_id}:{provider}")
+    await mutex.acquire()
+    try:
+        async with transaction() as db:
+            result = await db.execute(
+                delete(UserApiKey)
+                .where(
+                    UserApiKey.user_id == principal.user_id,
+                    UserApiKey.provider == provider,
+                )
+                .returning(UserApiKey.id)
             )
-            .returning(UserApiKey.id)
-        )
-        if result.scalar_one_or_none() is None:
-            raise AppException(404, "API_KEY_NOT_FOUND", "Stored key not found")
+            if result.scalar_one_or_none() is None:
+                raise AppException(404, "API_KEY_NOT_FOUND", "Stored key not found")
+    finally:
+        await mutex.release()
 
 
 async def validate(principal: Principal, provider: str) -> dict:

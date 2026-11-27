@@ -64,6 +64,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "Keyring must contain CURRENT_KEY_VERSION and 32-byte keys"
             )
+        if len(set(keys.values())) != len(keys):
+            raise ValueError("Keyring versions must use distinct key material")
         raw_values = self.encryption_master_keys or (
             {self.current_key_version: self.encryption_master_key}
             if self.encryption_master_key

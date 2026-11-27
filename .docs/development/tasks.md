@@ -164,7 +164,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Deletion cascades and completely removes all associated API keys, conversations, history, highlights, and settings.
   - Writes `revoked_users:{user_id}` to Redis with TTL=3600s, instantly rejecting any in-flight active access tokens across all devices.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_user_lifecycle.py -v`
+  - Test: auth-focused integration files cover deletion (`tests/integration/test_send_disconnect_domain_password.py`, `tests/integration/test_account_cache_url_refresh_errors.py`); no dedicated `test_user_lifecycle.py` exists.
   - Screenshot: Response from `DELETE /api/v1/users/me` returning `204 No Content` and verifying database record removal.
 
 ---
@@ -183,7 +183,8 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `PATCH /api/v1/users/me/settings` updates specified fields and increments the `version` integer for sync.
   - Invalid settings (e.g. unsupported provider, invalid language code) return `422 VALIDATION_ERROR`.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_settings_api.py -v`
+  - Test: `pytest tests/integration/test_concurrency_privacy_review.py -k "settings or provider or privacy" -v` (no dedicated `test_settings_api.py` exists).
+  - Note: unsupported `default_provider` returns `400 UNSUPPORTED_PROVIDER` per `.docs/api/endpoints.md`, not the generic `422 VALIDATION_ERROR`.
   - Screenshot: Postman/Swagger UI showing `PATCH /api/v1/users/me/settings` updating `accessibility_profile` with `200 OK`.
 
 ---
@@ -208,7 +209,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Load both keys in every process, switch all writers to `v2`, migrate in bounded ciphertext compare-and-swap batches, then verify zero `v1` writers/records before removing the old live key. Cover concurrent user key replacement and interrupted/resumed migration; follow the commands runbook.
   - Logs never contain plaintext keys (`FR-KEY-07`, `FR-OPS-03`).
 - **Verification / Screenshot**:
-  - Test: `pytest tests/unit/test_security_vault.py tests/integration/test_api_keys_api.py -v`
+  - Test: `pytest tests/unit/test_security_vault.py -v` plus vault assertions inside the integration suite (`store_key` in `tests/integration/test_ai_quiz_oauth_admin.py` checks ciphertext format, absence of plaintext in DB and responses, and decrypt roundtrip); no dedicated `test_api_keys_api.py` exists.
   - Screenshot: Database query output showing encrypted string in `encrypted_key` column alongside Swagger UI response showing masked `key_hint`.
 
 ---
