@@ -34,3 +34,6 @@
 - Every database interaction must be async: `await db.execute(...)`.
 - Always use `db.scalars().all()` or `db.scalar(...)` instead of raw tuples.
 - Never use blocking libraries (e.g., standard `requests`, `time.sleep`) in route handlers or services. Always use `httpx.AsyncClient` and `asyncio.sleep`.
+
+## 5. Implemented Response Boundaries
+Shared typed envelopes and public ORM response fields live in `app/schemas/responses.py`. Services serialize explicit public field allowlists; ciphertext, password hashes, token hashes and the server sync clock are never included. Routers delegate to services and do not execute ORM queries.

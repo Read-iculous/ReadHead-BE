@@ -25,20 +25,21 @@
 - **Context**: The backend needs to decrypt user API keys to make upstream calls on their behalf, so one-way hashing (like bcrypt) cannot be used. Key rotation must not cause downtime, and nonce reuse in GCM mode is catastrophic.
 - **Decision**: Store API keys encrypted using **AES-256-GCM** (Authenticated Encryption with Associated Data). Ciphertext is stored as `<version>:<base64_nonce>:<base64_ciphertext>:<base64_auth_tag>` (e.g. `v1:...`, `v2:...`). 
   1. **Strict Nonce Isolation**: Every encryption call MUST generate a cryptographically secure random 12-byte Nonce via `secrets.token_bytes(12)`. Static or predictable nonces are strictly prohibited to prevent GCM Nonce Reuse attacks.
-  2. **Keyring Support**: The application supports a Keyring dictionary (`ENCRYPTION_MASTER_KEYS={"v1":"...", "v2":"..."}`) allowing running workers to decrypt both old and new versions concurrently, while new writes always use `CURRENT_KEY_VERSION`. Fernet and CBC modes are explicitly eliminated.
+  2. **Rotation order**: Load both versions everywhere, switch all writers to the new version, migrate with ciphertext compare-and-swap, then verify zero old-version rows/writers before removing the old live key. Keep recovery keys for retained backups. Follow `.docs/development/commands.md` for the runbook.
+  3. **Keyring Support**: The application supports a Keyring dictionary (`ENCRYPTION_MASTER_KEYS={"v1":"...", "v2":"..."}`) allowing running workers to decrypt both old and new versions concurrently, while new writes always use `CURRENT_KEY_VERSION`. Fernet and CBC modes are explicitly eliminated.
 - **Consequences**:
   - *Pros*: Strong cryptographic security at rest with authentication tag verification preventing ciphertext tampering. Dual-key keyring enables 100% zero-downtime key rotation.
   - *Cons*: Keyring rotation requires keeping the old key in configuration until the background migration re-encrypts all database records.
 
 ---
 
-## ADR-004: Dual JWT Token Architecture (Access + Refresh Tokens)
-- **Status**: Accepted
-- **Context**: Extension users expect long-lived sessions without having to re-authenticate daily, while security requires short-lived access tokens.
-- **Decision**: Issue short-lived Access Tokens (15 minutes) and longer-lived Refresh Tokens (30 days) with token rotation on refresh, atomic Redis distributed locking (`lock:refresh:{token_hash}`), and a 30-second concurrency grace period. Database-backed token tracking allows immediate session revocation.
-- **Consequences**:
-  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens are rotated safely across concurrent tabs without triggering false-positive reuse detection; sessions can be invalidated instantly upon logout or administrative action.
-  - *Cons*: Extension needs token-refresh interceptors to handle 401s seamlessly.
+## ADR-004: Session-Scoped JWT Rotation and Failure Isolation
+- **Status**: Accepted; backend implemented, automated error/concurrency verification deferred.
+- **Decision**: Login/OAuth creates `auth_sessions`; access tokens last 15 minutes, refresh tokens 30 days, and both carry the same `sid` throughout a rotation chain. PostgreSQL session expiry/revocation is checked on authenticated requests and before returning any cached pair.
+- **Concurrency**: Redis lock `lock:refresh:{sid}:{token_hash}` uses a 5-second owner-checked lease, a post-acquisition cache recheck and a 2-second bounded wait. PostgreSQL session-row locking plus an atomic conditional token update is the final double-rotation guard, including Redis failure/lease expiry.
+- **Grace**: `refresh_grace:{sid}:{old_token_hash}` lasts 30 seconds and is indexed by `refresh_grace_keys:{sid}`. Logout revokes the whole session and its tokens, then cleans that session's exact cache keys. Cached pairs from a revoked session are unusable even if cleanup fails.
+- **Failure isolation**: Track token reasons `rotated`, `logout`, `security` and `revoked_at`. A missing rotation result within the grace interval returns `503 REFRESH_TEMPORARILY_UNAVAILABLE`; an older rotated token returns `401 REFRESH_TOKEN_REVOKED`. Neither cache failure nor lock contention alone revokes unrelated sessions. Explicit security events revoke affected sessions. Do not persist token-pair recovery copies in PostgreSQL in the MVP.
+- **Canonical protocol**: `.docs/technical/auth-flow.md` §2.3–2.5 specifies validation, temporary failures, refresh-only retries and cleanup.
 
 ---
 
@@ -67,10 +68,11 @@
 - **Decision**: Introduce integer `version` columns on synchronized records. Sync mutations execute an **Atomic Conditional SQL Update**:
   ```sql
   UPDATE conversations 
-  SET title = :title, version = version + 1, updated_at = NOW() 
+  SET title = :title, version = version + 1, updated_at = :sync_timestamp
   WHERE id = :id AND version = :base_version
   RETURNING id;
   ```
+  Allocate `:sync_timestamp` under the user-row lock according to ADR-013; filter by authenticated `user_id` in the real query.
   If affected rows == 0, the server immediately raises a `409 SYNC_CONFLICT` error with both versions, strictly preventing silent data loss without requiring table-level locks.
 - **Consequences**:
   - *Pros*: Strictly complies with `FR-SYN-05` ("System SHALL NOT silently overwrite preserved data") and eliminates multi-thread race conditions.
@@ -102,12 +104,12 @@
 - **Status**: Accepted
 - **Context**: Access Tokens have a 15-minute lifetime. When an admin bans an account or a user deletes their profile, waiting for JWT expiration creates a security risk. Conversely, if Redis experiences downtime, hard-failing readiness probes (503) causes Kubernetes/Ingress to kill routing, preventing built-in database fallbacks from executing.
 - **Decision**:
-  1. **New Requests & Token Revocation**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check and rejects revoked users with `401 USER_SUSPENDED`.
-  2. **Active Streams**: Running SSE async generators inspect user revocation status between yielded tokens. Upon detecting a revocation event, the generator immediately yields an `event: error` (`USER_SUSPENDED`) and terminates the stream.
+  1. **New Requests & Token Revocation**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` dependency checks Redis markers plus authoritative PostgreSQL user/session validity. Suspended users return `401 USER_SUSPENDED`; revoked access-token sessions return `401 UNAUTHORIZED`.
+  2. **Active Streams**: Running SSE async generators inspect user and session revocation markers between yielded tokens. User suspension/deletion emits `event: error` (`USER_SUSPENDED`); session logout emits `UNAUTHORIZED`. The stream then terminates. Redis outage follows the degraded-mode exception below.
   3. **Readiness Probe & Degraded Mode Policy**:
      - PostgreSQL is a **hard dependency**: if DB is unreachable, `/api/v1/health` returns `503 Service Unavailable`.
      - Redis is a **soft dependency with graceful degradation**: if Redis is unreachable while DB is healthy, `/api/v1/health` returns `200 OK` with status `"degraded"` (`{"status": "degraded", "checks": {"database": {"status": "healthy"}, "redis": {"status": "unhealthy"}}}`). This keeps pods in rotation while degrading non-critical features:
-       - *Auth*: Bypasses Grace Cache and checks revocation directly against PostgreSQL.
+       - *Auth*: Checks user/session revocation directly against PostgreSQL. Refresh uses the same DB session-row lock and conditional update; unavailable rotation results return `503 REFRESH_TEMPORARILY_UNAVAILABLE` without global logout (ADR-004).
        - *Rate Limiting*: Falls back to local in-memory sliding window or permits requests.
        - *Streaming Concurrency*: Bypasses multi-stream restriction temporarily; active streams ignore Redis connection loss mid-stream and continue delivering tokens to completion.
        - *Ephemeral Quizzes*: Returns `503 SERVICE_DEGRADED` as quizzes in Privacy Mode require caching.
@@ -120,7 +122,7 @@
 - **Status**: Accepted
 - **Context**: Unbounded long-lived SSE connections can exhaust backend workers. PDF document uploads can balloon server disk/RAM. Untrusted web page text can harbor prompt injection attacks against LLMs.
 - **Decision**:
-  1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (`slowapi`) apply strictly to the initial HTTP handshake.
+  1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (native async Redis fixed windows) apply strictly to the initial HTTP handshake.
   2. **Zero-Binary PDF Handling**: Browser extension extracts clean text locally using bundled Mozilla `pdf.js` (max 102,400 bytes UTF-8 text extract); zero raw PDF binaries are uploaded to the backend.
   3. **Prompt Injection Fencing**: Backend wraps web-derived contexts in XML delimiter tags (`<untrusted_web_context>` and `<user_selected_text>`) with immutable system prompt instructions commanding the LLM to treat inner text purely as passive reference data.
 - **Consequences**:
@@ -136,6 +138,7 @@
   1. **Session Identification & Explicit Bind Flow**:
      - Browser tabs generate a `reading_session_id` (UUIDv4) stored in tab `sessionStorage`.
      - When opened from the dashboard or history list, `conversations.reading_session_id` defaults to `NULL` (unbound readonly mode).
+     - Continuing an existing standard-mode conversation requires non-null matching stored/requested session IDs. An unbound conversation remains read-only even when the request also omits its session ID (`400 TAB_CONTEXT_MISMATCH`).
      - To interact with an existing conversation from an active tab, the client sends `POST /api/v1/ai/conversations/{id}/bind` passing its `reading_session_id`.
      - If the conversation is currently streaming tokens in another tab, the bind request is rejected with `409 CONVERSATION_BUSY`.
      - When history is cleared (`page_url IS NULL`), any tab can bind to the conversation and context checking against the original URL is bypassed.
@@ -150,25 +153,15 @@
 
 ---
 
-## ADR-013: Multi-Entity Sync Pagination & 30-Day Tombstone Expiration
-- **Status**: Accepted
-- **Context**: Synchronizing three distinct entity types (`conversations`, `highlights`, `settings`) through a single cursor created pagination ambiguity. Additionally, soft-deleted tombstones are purged after 30 days, creating a data desynchronization risk for devices offline for extended periods (> 30 days).
-- **Decision**:
-  1. **Multi-Entity Pagination**: Standardize `POST /api/v1/sync/pull` to return independent Composite Cursors per entity group:
-     ```json
-     "next_cursors": {
-       "conversations": "c_base64...",
-       "highlights": "h_base64...",
-       "settings": "s_base64..."
-     }
-     ```
-     Alternatively, batch slicing applies `limit` across a unified timestamp change stream ordered by `(updated_at, entity_type, entity_id)` ensuring deterministic pagination without missing updates during concurrent writes.
-  2. **30-Day Tombstone Expiry & Full Resync Mandate**:
-     - Database cleans up soft-deleted records (`is_deleted = TRUE`) older than 30 days.
-     - If an offline client attempts an incremental sync with a cursor older than 30 days (`cursor_timestamp < NOW() - INTERVAL '30 days'`), the backend rejects the pull with `410 CURSOR_EXPIRED` and payload `{"requires_full_sync": true}`.
-     - The client extension must wipe its local cache and perform a full initial resynchronization, preventing stale deleted records from persisting locally forever.
-- **Consequences**:
-  - *Pros*: Guarantees data consistency across long-dormant devices and clear pagination semantics across multiple entity types.
+## ADR-013: One Unified Sync Cursor and Non-Destructive Full Resync
+- **Status**: Accepted; backend implemented, automated error/concurrency verification deferred.
+- **Decision — one cursor**: Merge user-owned `conversations`, `highlights` and `user_settings` rows (including tombstones) with `UNION ALL`, label their `entity_type` as `conversation`, `highlight`, `settings`, and order by `(updated_at ASC, entity_type ASC, id ASC)`. `limit` (1–100) applies to the combined result, not to each table. Messages are fetched separately. Only `cursor`/`next_cursor` exist; there are no per-entity cursor fields.
+- **Opaque cursor format**: Base64url JSON with `v: 1`, `kind`, `t` and `anchor`. A `position` cursor additionally contains `entity_type` and a full UUID `id`; it resumes strictly after that tuple. A `checkpoint` cursor resumes at `updated_at > t`. `anchor` is the time of the previous completed checkpoint, or the initial full-pull start time, and stays unchanged throughout pagination. Validate fields/types and reject unsupported/malformed cursors with `400 INVALID_SYNC_CURSOR`; queries always filter by the authenticated user.
+- **Concurrent writes and commit order**: All synchronized writes (including direct REST operations, user settings creation, message appends, history clearance, soft deletes and sync push) first lock the owning `users` row using `SELECT ... FOR UPDATE` in a short transaction. Allocate a timestamp `GREATEST(clock_timestamp(), users.sync_clock + INTERVAL '1 microsecond')`, update `users.sync_clock`, and stamp changed synchronized rows with that value. Preserve the existing conditional `version` update. Acquire the user lock before entity locks and hold it through commit. Never stamp these writes solely with transaction-start `NOW()`.
+- **Pull algorithm**: Each page obtains the same user row lock before reading the merged result. Fetch `limit + 1` rows to compute `has_more`; return at most `limit`, grouped into the documented response arrays/object. If more rows exist, `next_cursor` is a `position` at the last returned tuple, retaining `anchor`. Otherwise advance `users.sync_clock` with the allocator and return a `checkpoint` whose `t` and `anchor` equal that allocated value, even for an empty page. Commit and release the lock before returning. Thus a later writer must receive a timestamp after the completed checkpoint, including after a slow transaction or clock rollback. A row changed again between pages may be delivered again at a higher version; the client upserts by ID/version. This synchronizes latest state, not an audit log of every intermediate edit.
+- **Retention**: Retain tombstones at least 30 days from their deletion/update timestamp. The purge job takes the same user lock. Reject a cursor if `anchor` is older than 30 days with `410 CURSOR_EXPIRED` and `requires_full_sync: true`. A full pull (`cursor: null`) includes current live rows; expired clients must rebuild their synced cache. Initial pagination uses the full-pull start as `anchor`, so old live rows do not themselves cause expiration.
+- **Non-destructive resync**: Preserve credentials, drafts, ephemeral tab state and pending mutations. Build a new user-scoped synced cache in staging storage from `cursor: null`, then atomically replace only the old synced cache and install the completed checkpoint after every page succeeds. On failure retain the previous cache, cursor and pending work. New edits during the rebuild remain queued separately. Reconcile pending mutations against fresh server versions; stale edits/deletes surface conflicts and require resolution, never silent overwrite or resurrection. Do not replay queued AI requests. Account logout/switch still follows the separate account-isolation purge rule.
+- **Scope**: `users.sync_clock` is server-only metadata and is not part of user profile/settings mutation payloads. No long-lived DB snapshot/connection is held across HTTP pages.
 
 ---
 
@@ -179,17 +172,17 @@
   1. **Phase 1 (Pre-stream DB Transaction)**:
      - Check out transient DB session.
      - Authenticate user, decrypt BYOK key, verify tab session ownership.
-     - If standard mode: Create conversation (if new) and insert `user message` into `messages` table. Commit transaction and close DB session.
+     - If standard mode: Create conversation (if new) and insert `user message` into `messages` table. Allocate the sync timestamp and increment the conversation version for this append under the ADR-013 user-row lock; commit and close the DB session.
   2. **Phase 2 (Streaming Loop - Zero DB Connection)**:
      - Stream LLM tokens via SSE (`event: start`, `event: token`, `event: citation`).
      - Inspect Redis cancellation flags without DB connection.
   3. **Phase 3 (Post-stream DB Commit BEFORE Event Done)**:
      - Stream generation finishes from LLM.
      - Check out fresh transient DB session.
-     - Insert `assistant message`, increment `conversation.version = version + 1`, update `conversation.updated_at = NOW()`.
+     - Insert `assistant message`, increment `conversation.version = version + 1`, update `conversation.updated_at` using the ADR-013 sync timestamp allocator.
      - Commit DB transaction.
      - **Only after DB commit successfully finishes**, dispatch `event: done` to client.
-     - **Failure Handling**: If the database commit fails, do NOT send `event: done`. Instead, dispatch `event: error` with code `PERSISTENCE_FAILED`. The client keeps the assistant reply in local memory/UI and displays a retry persistence prompt.
+     - **Failure Handling**: If the database commit fails, do NOT send `event: done`. Instead, dispatch `event: error` with code `PERSISTENCE_FAILED`. For the MVP, the client keeps the reply in the current UI memory, labels it "Not saved", and allows copying. No retry-save endpoint or automatic AI replay exists. In Privacy Mode, do not persist this UI text outside the declared ephemeral storage.
   4. **Privacy Mode**: Skip DB writes in Phase 1 and Phase 3 entirely; dispatch `event: done` immediately after LLM finishes streaming.
 - **Consequences**:
   - *Pros*: Zero pool starvation, guaranteed message persistence before client receives success signal, clear error handling on storage failures.

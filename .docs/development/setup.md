@@ -12,13 +12,13 @@
 ### Step 2.1: Clone & Create Virtual Environment
 ```bash
 # In the project root
-python -m venv venv
+python3 -m venv .venv
 
 # Activate virtual environment
 # On Windows (PowerShell):
-.\venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 # On Linux/macOS:
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 ### Step 2.2: Install Dependencies
@@ -70,3 +70,5 @@ uvicorn app.main:app --reload --port 8000
 Open interactive API docs in your browser:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+If standard service ports are occupied, set `POSTGRES_PORT`/`REDIS_PORT` and update the URL ports in `.env` before `docker compose up -d`. The API can also be packaged using the root `Dockerfile`; supply environment configuration at runtime and run migrations separately. Focused regressions and opt-in Redis / Chrome Swagger / PostgreSQL checks are available; the full integration/error suite remains incomplete. Consult `implementation-status.md` and the README for commands and verified scope.

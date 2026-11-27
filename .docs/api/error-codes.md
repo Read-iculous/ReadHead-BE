@@ -23,7 +23,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `401` | `TOKEN_EXPIRED` | Access token has expired; client should refresh |
 | `401` | `TOKEN_INVALID` | Malformed or improperly signed JWT |
 | `401` | `REFRESH_TOKEN_EXPIRED` | Refresh token expired; user must log in again |
-| `401` | `REFRESH_TOKEN_REVOKED` | Refresh token was explicitly logged out, rotated or invalidated |
+| `401` | `REFRESH_TOKEN_REVOKED` | Session/token revoked by logout/security, or rotated token used outside grace; does not automatically revoke unrelated sessions |
 | `401` | `USER_SUSPENDED` | Account has been suspended or banned by administrator |
 | `403` | `ACCOUNT_INACTIVE` | Account has been deactivated |
 | `403` | `EMAIL_NOT_VERIFIED` | OAuth identity provider indicates email has not been verified |
@@ -32,7 +32,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 ### 2.2 Validation & Client Errors (`400`, `422`)
 | HTTP Status | Error Code | Description |
 |---|---|---|
-| `422` | `VALIDATION_ERROR` | Pydantic schema validation failure |
+| `422` | `VALIDATION_ERROR` | General schema validation failure, including NUL/invalid Unicode in PostgreSQL-bound text and email exceeding 255 characters after normalization; domain-specific cases below take precedence |
 | `400` | `INVALID_JSON` | Malformed JSON request body |
 | `400` | `OAUTH_EMAIL_MISSING` | OAuth provider account has no public or verified email address |
 | `400` | `CANNOT_MODIFY_SELF_STATUS` | Administrators cannot suspend, ban, or alter their own account status |
@@ -60,15 +60,16 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 |---|---|---|
 | `409` | `SYNC_CONFLICT` | Stale version detected. Target record was updated by another device |
 | `409` | `CONVERSATION_BUSY` | Conversation is actively streaming tokens in another tab session |
-| `410` | `CURSOR_EXPIRED` | Sync cursor timestamp is older than 30 days (tombstones purged). Client must trigger full resync |
-| `400` | `INVALID_SYNC_MUTATION` | Malformed mutation payload or unknown entity type |
+| `410` | `CURSOR_EXPIRED` | Cursor retention anchor older than 30 days; rebuild synced cache while preserving drafts, credentials and pending mutations |
+| `400` | `INVALID_SYNC_CURSOR` | Invalid Base64url cursor, unsupported version or invalid tuple/checkpoint fields |
+| `400` | `INVALID_SYNC_MUTATION` | Malformed mutation schema/payload, unsupported entity type/action, or invalid entity fields; an invalid batch is atomic and applies no changes |
 
 ### 2.6 AI Gateway & BYOK Errors (`400`, `502`, `504` — Features C & E)
 | HTTP Status | Error Code | Description |
 |---|---|---|
 | `400` | `NO_ACTIVE_API_KEY` | User has not configured an active API key for the provider |
 | `400` | `KEY_VALIDATION_FAILED` | Key rejected by provider during initial validation ping |
-| `400` | `UNSUPPORTED_PROVIDER` | Requested provider is not implemented |
+| `400` | `UNSUPPORTED_PROVIDER` | Unsupported provider string in body, settings or provider path; missing required fields and wrong data types remain `422 VALIDATION_ERROR` |
 | `400` | `TAB_CONTEXT_MISMATCH` | Inbound request mixed conversation ID with incompatible tab context |
 | `422` | `UNREPRESENTATIVE_SOURCE` | Extracted page content insufficient to generate grounded response or quiz |
 | `502` | `UPSTREAM_AI_ERROR` | Provider API (OpenAI/Gemini/Claude) returned an error |
@@ -83,6 +84,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `500` | `ENCRYPTION_ERROR` | Key decryption failure (invalid master key) |
 | `500` | `PERSISTENCE_FAILED` | Failed to atomically commit stream completion and assistant message to database |
 | `503` | `DEPENDENCY_UNHEALTHY` | Database connection failure (hard service outage) |
+| `503` | `REFRESH_TEMPORARILY_UNAVAILABLE` | Refresh lock timeout or recently rotated token with unavailable grace result; Retry-After: 1, no global logout |
 | `503` | `SERVICE_DEGRADED` | Ephemeral feature temporarily unavailable due to Redis downtime |
 
 ### 2.8 Rate Limiting & Concurrency (`429` — Platform Ops & Guardrails)
