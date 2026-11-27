@@ -352,6 +352,7 @@ async def test_domain_error_mapping_preserves_json_and_other_enum_errors(
     )
     assert malformed.status_code == 400
     assert malformed.json()["code"] == "INVALID_JSON"
+    assert malformed.json()["field"] is None
 
 
 @pytest.mark.asyncio
