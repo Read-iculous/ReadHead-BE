@@ -247,3 +247,32 @@
 - **Consequences**:
   - *Pros*: Zero schema cost (no new table, migration `0007` only drops the unused bookmark column); deterministic and auditable rules; instant reset on data deletion; consent/privacy boundaries reuse ADR-017 mechanisms unchanged.
   - *Cons*: Rule-based signals are coarser than ML models and cannot retro-analyze before data existed; user-turn proxy over-counts multi-turn chats per domain; thresholds need tuning via configuration as real usage lands.
+
+---
+
+## ADR-019: Role Management Bootstrap via CLI (no role-change API)
+- **Status**: Accepted (CLI promotion behavior is implemented; the no-API rule is binding for future work)
+- **Context**: The Admin Portal spec lists "role management (`user` / `admin`)" among portal capabilities. Any API endpoint that promotes an existing account to `admin` becomes a self-service escalation surface: a compromised admin credential (or a bug in the endpoint's authorization) converts one stolen session into permanent platform control, and role changes made over HTTP are invisible unless a separate audit mechanism is built first. The MVP already has a working, operator-controlled path: `python -m app.cli.create_admin` (see `.docs/development/setup.md` §2.5 and `.docs/development/commands.md` §5).
+- **Decision**:
+  1. **CLI-only role promotion**: The only supported way to create or elevate an administrator is the CLI (`app/cli/create_admin.py`). Promoting an *existing* account is deliberately **refused** by the CLI — it bootstraps a new admin account instead, so an attacker with server access cannot silently escalate an already-active user account that may have curated history.
+  2. **No role-change endpoint**: No `PATCH /admin/users/{id}/role` (or equivalent) will be implemented in the MVP. Demotion/de-provisioning of an admin is an operator action performed directly against the database (or by deleting the account), outside the API surface.
+  3. **Re-read authorization**: `require_admin` re-reads the user's role from the database on every request (no role claims trusted from JWT), so a demoted or suspended admin loses access immediately.
+- **Consequences**:
+  - *Pros*: No HTTP escalation surface; promotion requires server-level access, which is a strictly stronger trust boundary; smallest possible MVP scope; the CLI path is already tested and documented.
+  - *Cons*: Operating an admin lifecycle (new admin, lost credentials of a second admin) requires shell access to the deployment host; a future multi-tenant/hosted offering would need to revisit this ADR together with ADR-020's audit trail.
+
+---
+
+## ADR-020: Admin Audit Trail — Append-Only `admin_audit_logs` (docs complete; NOT implemented — BE-27)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: Moderation actions (suspend/ban/reactivate §9.3, admin-triggered password reset §9.5) and CLI role promotion (ADR-019) currently leave at best a log line. Without a durable, queryable record there is no way to answer "who banned whom, when" after an incident, and the last-admin lockout rule (§9.3) cannot be reviewed. A full admin UI for audit browsing is disproportionate to the MVP.
+- **Decision**:
+  1. **One append-only table**: `admin_audit_logs` (schema §2.16, migration `0008`): `actor_user_id` (FK users, cascade), nullable `target_user_id` (FK users, set-null — NULL for CLI-wide actions), `action` enum (`user_status_changed`, `password_reset_link_sent`, `role_promoted_cli`, ...), `details` JSONB (e.g. `old_status`/`new_status`), nullable `request_id`, `created_at`. Indexes `(actor_user_id, created_at DESC)` and `(target_user_id)`. No update/delete path exists in the MVP.
+  2. **Logged actions**: every accepted `PATCH /admin/users/{id}/status` change (suspend/ban/reactivate, including admin-on-admin), a successful `POST /admin/users/{id}/send-reset-link` dispatch (once BE-19 code lands), and CLI role promotion — the CLI writes its row directly with `request_id = NULL`.
+  3. **Read surface, not UI**: `GET /admin/audit-logs` (endpoints §9.6, admin-only, paginated, filterable by `action`/`target_user_id`) answers accountability queries; there is **no frontend UI in the MVP** — operators may also query via `psql`.
+  4. **Retention: 90 days**. The cleanup job is *planned* and deferred to a later task; BE-27 ships the table and writes only.
+  5. **Last-admin lockout (companion rule)**: `PATCH /admin/users/{id}/status` rejects suspending or banning the last active administrator with `400 LAST_ADMIN_LOCKOUT`, so the platform always retains at least one active admin; admin-on-admin moderation of *other* admins stays allowed (and is audited).
+  6. **Privacy boundary**: rows are behavioral metadata of moderation actions only — outside the Privacy Mode storage matrix, which governs user reading/conversation content.
+- **Consequences**:
+  - *Pros*: Durable accountability for every status change and promotion; simple additive migration; queryable without UI; retention is bounded by policy.
+  - *Cons*: 90-day retention is unenforced until the cleanup job lands; accountability depends on the table actually being written by every future admin action (a review rule, not an enforcement mechanism); no UI means ad-hoc `psql` access for operators.

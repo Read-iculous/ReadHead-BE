@@ -107,6 +107,38 @@ docker compose down -v
 4. Verify every active writer still uses `v2`, no database row has a `v1:` prefix, and a second scan finds zero remaining `v1` rows. Only then remove `v1` from live keyrings. Retain old key material securely for the backup-restore retention policy; restoring an old backup requires its matching key.
 5. On migration failure keep the dual keyring and continue serving reads/writes with `v2`; resume migration. Never remove a key still referenced by a record. Rolling back a writer to `v1` invalidates the completion check and requires another migration scan.
 
+### Backup & Restore Runbook
+
+> **Scope note**: This runbook documents the backup/restore *procedure* only. RTO/RPO targets (FR-OPS-05, SYS-QLT-RAM-005) are **placeholders — not yet approved by operations**; do not quote any number below as a service commitment until they are signed off.
+
+**Backup (PostgreSQL via `pg_dump`)**
+1. Dump the whole database in custom format (compressed, restorable with selective parallelism):
+   ```bash
+   pg_dump --format=custom --file "readhead_$(date -u +%Y%m%dT%H%M%SZ).dump" "$DATABASE_URL"
+   ```
+2. Recommended schedule until an approved policy exists (placeholder, subject to FR-OPS-05 sign-off):
+   - **Daily** full dump, kept 7 days.
+   - **Weekly** full dump, kept 4–8 weeks.
+   - Retention beyond that requires an approved policy; do not accumulate unbounded dumps.
+3. **Every backup MUST be paired with the `ENCRYPTION_MASTER_KEYS` keyring version(s) active at dump time.** User API keys are AES-256-GCM encrypted with versioned master keys: restoring an old backup against a keyring that lacks the matching version yields `500 ENCRYPTION_ERROR` for every affected user. Store the key version mapping alongside each dump (e.g. `readhead_20261129T020000Z.dump.keys-v1v2.txt`), encrypted or in the same secret store as the keys — never in plaintext next to the dump. This pairing is the same constraint enforced by the Zero-Downtime Rotation Runbook above: keep retired key material until it is no longer referenced by *any* backup within the retention window.
+4. **Redis is NOT backed up.** Redis holds only revocation tombstones, rate-limit buckets, stream leases and TTL caches. After a restore, tombstones are **recreated by a full resync of the client** (ADR-013 full-resync semantics rebuild the client cache from PostgreSQL), and rate/lease state simply expires. Never restore a stale Redis snapshot under a fresh database — it can resurrect tombstone state for users that no longer match.
+
+**Offsite storage (recommendation)**: copy dumps and the key-version mapping to an offsite location (object storage or a separate host) with access control distinct from the database host, and verify the transfer succeeded (checksum) — a backup that only lives on the database host does not survive host loss. Encryption at rest for the offsite copy is recommended; this is a recommendation, not an approved policy.
+
+**Restore procedure**
+1. Stop writers (or deploy the maintenance banner) so the restored database is not forked against newer writes; note the exact dump timestamp — everything after it is lost.
+2. Provision the target PostgreSQL 15 instance and confirm the matching `ENCRYPTION_MASTER_KEYS` keyring (including the key versions recorded for the dump) is distributed to all API workers **before** they start.
+3. Restore:
+   ```bash
+   pg_restore --clean --if-exists --dbname "$DATABASE_URL" "readhead_<timestamp>.dump"
+   ```
+4. Align Alembic: `alembic current` on the restored database must equal the revision that was head at the dump time; if an older revision is found, apply `alembic upgrade head` (later migrations are already baked into newer dumps).
+5. Start the API workers and verify health: `GET /api/v1/health` returns `status: "healthy"` (§1.1) and `GET /api/v1/health/live` returns the live probe (§1.2).
+6. Spot-check a user with a stored BYOK key: a key listing or validation ping must succeed (proves the master-key pairing); failures here mean the wrong keyring was supplied — stop and fix keys before serving traffic.
+7. Clients detect the data rollback via sync versions and perform a **full resync** (ADR-013), which also re-establishes the Redis-side state that was deliberately not backed up.
+
+**Restore drill**: rehearse the full procedure on a disposable instance at least quarterly (placeholder cadence until FR-OPS-05/RPO-RTO targets are approved) — restore the newest dump against throwaway PostgreSQL/Redis, run steps 3–7, and record the elapsed time as draft RTO evidence. A backup that has never been restored is not a backup.
+
 ### Resend Email Runbook (BE-19)
 
 **Domain setup (SPF / DKIM / DMARC)**

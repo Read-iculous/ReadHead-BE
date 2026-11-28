@@ -36,6 +36,7 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `400` | `INVALID_JSON` | Malformed JSON request body |
 | `400` | `OAUTH_EMAIL_MISSING` | OAuth provider account has no public or verified email address |
 | `400` | `CANNOT_MODIFY_SELF_STATUS` | Administrators cannot suspend, ban, or alter their own account status |
+| `400` | `LAST_ADMIN_LOCKOUT` | Suspending or banning the **last active administrator** is rejected (`PATCH /admin/users/{id}/status`, planned — BE-27). Moderating other administrators remains allowed; the last admin must always be able to act on everyone else |
 | `400` | `QUIZ_ALREADY_SUBMITTED` | Quiz has already been submitted and graded; submitted quizzes cannot be retaken (no retry/reset path) |
 | `400` | `UNSUPPORTED_LANGUAGE` | Unsupported language value: `ui_language` outside `{vi, en}` in `PATCH /users/me/settings`, or `target_language` outside the supported translation set (`vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es`) in settings PATCH or `POST /ai/stream` |
 | `409` | `EMAIL_ALREADY_EXISTS` | Registration email already registered (also `PATCH /users/me` email change) |

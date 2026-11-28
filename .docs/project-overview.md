@@ -45,6 +45,15 @@ The system encompasses 12 functional feature groups (Features A through L):
   - *System Telemetry & Health*: Live overview of total requests, upstream AI provider distribution (OpenAI vs Gemini vs Claude), error rates, and user feedback satisfaction score.
   - *Privacy Guarantee*: Admin has zero access to user decrypted API keys, reading text, or private conversation logs.
 
+### Billing Statement (BYOK-Only — BR-39~41)
+ReadHead has **no billing relationship with its users**. The platform is strictly BYOK (Bring Your Own Key): every AI operation uses the user's own provider API key, stored encrypted in the BYOK Vault (Feature C). Consequently:
+- **No fees, subscriptions or paid tiers** are charged by ReadHead — there is no payment processing, invoicing or plan management anywhere in the backend.
+- **No usage quota is imposed by the platform** — request limits (rate limiting) exist only for abuse/availability protection, not for monetization; consumption ceilings are whatever the user's own provider plan permits.
+- **All LLM costs are borne directly by the user** with their own provider account (BR-39–41); ReadHead never proxies paid usage through its own credentials and never bills for token consumption. Usage aggregates (`usage_daily`, `GET /users/me/usage`) exist purely for the user's own visibility, not for charging.
+
+### Monitoring Scope Statement (SYS-FUN-062)
+Operational monitoring in the MVP is deliberately limited to **health probes** (`GET /health`, `GET /health/live` — endpoints §1.1–§1.2) and the **admin telemetry aggregate** (`GET /admin/telemetry` — §9.1). APM agents, Prometheus/Grafana metrics pipelines, distributed tracing and automated alerting are **out of scope** for the MVP (SYS-FUN-062; OpsCon out-of-scope). Diagnostic capability rests on correlation-request-ID logging and the documented runbooks (`commands.md`); extending monitoring is a future, explicitly-scoped effort.
+
 ---
 
 ## 4. Key Target Users & Stakeholders (StRS §3.1)

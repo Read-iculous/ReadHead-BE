@@ -246,6 +246,20 @@ Daily per-user/provider/model aggregate counters, upsert-incremented after each 
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last increment timestamp |
 *(Unique Constraint: `[user_id, date, provider, model]`. Writes use an atomic upsert-increment (`ON CONFLICT ... DO UPDATE SET request_count = usage_daily.request_count + 1, input_tokens = usage_daily.input_tokens + EXCLUDED.input_tokens, ...`). Streams cancelled mid-flight before the provider's usage frame may be absent from the aggregate; rows are not part of `/sync` — see `.docs/api/endpoints.md` §8.)*
 
+### 2.16 `admin_audit_logs` (Admin Audit Trail — BE-27, planned; migration `0008`)
+Append-only behavioral metadata of administrative actions: who changed which account, when, and with what outcome. Content-free — no reading text, no decrypted keys, no emails beyond the recorded UUIDs — so it sits **outside the Privacy Mode storage matrix** (Privacy Mode governs user reading/conversation data, not records of moderation the admin themselves performed).
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
+| `actor_user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE); the admin (or CLI service identity) who performed the action |
+| `target_user_id` | `UUID` | YES | NULL | FK -> `users.id` (ON DELETE SET NULL); affected account, NULL for CLI-wide actions |
+| `action` | `VARCHAR(50)` | NO | — | Enum: `user_status_changed`, `password_reset_link_sent`, `role_promoted_cli`, ... |
+| `details` | `JSONB` | NO | `'{}'` | Action payload, e.g. `{"old_status": "active", "new_status": "banned"}` |
+| `request_id` | `VARCHAR(64)` | YES | NULL | Correlation ID from the HTTP request; NULL for CLI-written rows |
+| `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Action timestamp |
+
+*(Indexes: `(actor_user_id, created_at DESC)` for "what did this admin do" history and `(target_user_id)` for "what happened to this account". Append-only in the MVP — no update/delete API; rows are written by `PATCH /admin/users/{id}/status` (§9.3), `POST /admin/users/{id}/send-reset-link` (§9.5, once BE-19 code lands) and directly by the `role_promoted_cli` CLI. **Retention: 90 days** — cleanup job is planned (deferred to a later task); until it exists, expired rows are harmless behavioral metadata. No frontend UI for the MVP; operators query via `psql` or `GET /admin/audit-logs` (endpoints §9.6).)*
+
 ## 3. High-Volume Composite Indexes
 
 Synchronized creates/updates, soft deletes, message appends and history clearance allocate `updated_at` under the `users` row lock using the server-only `sync_clock` (ADR-013). Clients cannot set this field. Per-entity cursor indexes include `(user_id, updated_at, id)` without excluding tombstones.

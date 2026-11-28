@@ -1165,6 +1165,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 - **Query Params**: `timeframe=24h` (`24h`, `7d`, `30d`)
 - **Metrics**: Content-free minute buckets retained for 31 days. Provider split counts dispatched AI operations; error rate includes non-2xx requests and SSE error events. No user text is collected.
 - Operational middleware observes early rate-limit replies too: each `429` contributes one request/error and latency sample, retaining CORS, `Retry-After` and request-ID headers.
+- **Error breakdown (planned — BE-27)**: the middleware minute bucket additionally maintains per-status counters `errors_429`, `errors_401` and `errors_504`; the overall `error_rate` is unchanged and remains the single total across all non-2xx requests and SSE error events. The response exposes the three buckets under `error_breakdown`; the `timeframe` query params and their semantics are unchanged.
 - **Response**: `200 OK`
   ```json
   {
@@ -1176,15 +1177,22 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
         "claude": 0.14
       },
       "error_rate": 0.012,
+      "error_breakdown": {
+        "rate_limit": 0.006,
+        "unauthorized": 0.004,
+        "upstream_timeout": 0.002
+      },
       "avg_latency_ms": 680
     }
   }
   ```
+  - `error_breakdown` values are per-timeframe rates (fraction of `total_requests`), parallel to `error_rate`. Until BE-27 lands, the field is absent from responses and only the total `error_rate` is reported.
 
 ### 9.2 GET `/api/v1/admin/users`
-- **Description**: List user accounts with role, status, and last activity timestamps.
+- **Description**: List user accounts with role and status.
 - **Auth**: Required (Role `admin`)
 - **Query Params**: `page=1&page_size=50&status=active`
+- **Search (planned — BE-27)**: additional optional `search` parameter — case-insensitive partial match (`ILIKE`) over `email` and `full_name`. The search value has SQL wildcards (`%`, `_`, `\`) escaped before binding, so literal user input is matched verbatim (no LIKE injection). It composes freely with `status` (AND semantics) and participates in the same pagination counters.
 - **Response**: `200 OK`
   ```json
   {
@@ -1209,8 +1217,10 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 
 ### 9.3 PATCH `/api/v1/admin/users/{id}/status`
 - **Description**: Update user account status (e.g. suspend or ban). Rejects self-modification with `400 CANNOT_MODIFY_SELF_STATUS` if `id == current_user.id` to prevent accidental platform administrative lockout.
+  - **Last-admin protection (planned — BE-27)**: suspending or banning the **last active administrator** is rejected with `400 LAST_ADMIN_LOCKOUT`. Admins can still moderate other administrators normally (with an audit entry).
   - **Ban / Suspend**: Sets PostgreSQL `users.status = status` and matching `is_active`, revokes all user auth sessions and active refresh tokens in DB (`security` reason), cleans their session-indexed grace caches, and sets Redis marker `revoked_users:{user_id} = status` (TTL = 3600s) for immediate session invalidation.
   - **Reactivate (`active`)**: Sets `users.status = 'active'`, `is_active = TRUE`, and deletes `revoked_users:{user_id}` from Redis. Existing revoked sessions remain revoked; sign in again.
+  - **Audit (planned — BE-27)**: every accepted status change writes one `admin_audit_logs` row (`actor_user_id` = calling admin, `target_user_id`, `action` = `user_status_changed`, `details` = `{old_status, new_status}`) — see §9.6.
 - **Auth**: Required (Role `admin`)
 - **Request Body**: `{"status": "suspended"}` // "active" | "suspended" | "banned"
 - **Response**: `200 OK`
@@ -1222,6 +1232,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
     }
   }
   ```
+- **Error codes**: `403 FORBIDDEN_RESOURCE` (non-admin), `400 CANNOT_MODIFY_SELF_STATUS`, `400 LAST_ADMIN_LOCKOUT` (planned — BE-27), `404 USER_NOT_FOUND`.
 
 ### 9.4 GET `/api/v1/admin/feedback`
 - **Description**: Retrieve user satisfaction logs and categorized problem reports (BR-15).
@@ -1254,12 +1265,45 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 - **Description**: Lets an administrator trigger the same password-reset email a user would receive from "forgot password", backing the admin portal's reset-password-link button. The link/token mechanics, TTL (60 minutes) and revocation semantics are identical to `POST /auth/forgot-password` (§2.7.3): the user sets the new password themselves via `POST /auth/reset-password`; admins never set or view passwords.
 - **Anti-abuse**: Response is neutral regardless of the target's existence/state (same anti-enumeration rule). Shares the per-email resend cap (3/hour) and logs the admin actor for audit. Rate-limited by the shared auth bucket plus the per-email cap.
 - **Privacy guard**: No per-user usage or reading data is revealed by this endpoint.
+- **Audit (planned — BE-27)**: when implemented, a successful dispatch writes one `admin_audit_logs` row (`actor_user_id`, `target_user_id`, `action = password_reset_link_sent`) alongside the existing log line — see §9.6.
 - **Auth**: Required (Role `admin`)
 - **Response**: `200 OK`
   ```json
   {"data": null, "message": "If that account exists, a reset link has been sent."}
   ```
 - **Error codes**: `403 FORBIDDEN_RESOURCE` (non-admin), `429 RATE_LIMIT_EXCEEDED`, `404 USER_NOT_FOUND` (only for a malformed/nonexistent ID parameter, not a registered-but-state-unknown account).
+
+### 9.6 GET `/api/v1/admin/audit-logs` (Admin Audit Trail — BE-27, planned)
+- **Description**: Paginated view of administrative actions recorded in `admin_audit_logs` (schema §2.16): who changed which account, when, and what the outcome was. This read-only query surface is the minimum tooling to answer "who banned whom, when" — there is no frontend UI for it in the MVP; operators may query the table directly via `psql`.
+- **Auth**: Required (Role `admin`)
+- **Query Params**: `page=1&page_size=50&action=user_status_changed&target_user_id=uuid`
+  - `action`: optional filter on the action enum (`user_status_changed`, `password_reset_link_sent`, `role_promoted_cli`, ...).
+  - `target_user_id`: optional filter for actions against a specific account (CLI actions may have no target).
+- **Response**: `200 OK`
+  ```json
+  {
+    "data": {
+      "items": [
+        {
+          "id": "uuid",
+          "actor_user_id": "uuid",
+          "target_user_id": "uuid",
+          "action": "user_status_changed",
+          "details": {"old_status": "active", "new_status": "banned"},
+          "request_id": "req-uuid-or-null",
+          "created_at": "2026-11-29T10:15:00Z"
+        }
+      ],
+      "total": 42,
+      "page": 1,
+      "page_size": 50,
+      "total_pages": 1
+    }
+  }
+  ```
+- **Privacy guardrail**: audit rows are behavioral metadata only (no emails beyond the admin's own search, no reading content, no decrypted keys) — outside the Privacy Mode storage matrix.
+- **Rate bucket**: general API bucket (`API_REQUESTS_PER_MINUTE`).
+- **Error codes**: `403 FORBIDDEN_RESOURCE` (non-admin), `422 VALIDATION_ERROR` (bad `target_user_id` format).
 
 ---
 

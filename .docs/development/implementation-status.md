@@ -23,6 +23,7 @@ Updated: 2026-11-21. Implementation status is separate from test/production read
 | BE-24 | — (planned: `GET /reading/history/stats`, `GET /users/me/reading-insights` on-the-fly aggregates, proactive `insight` field with 2/day/domain cap + 24h dismissal cache, ADR-018) | Docs complete; NOT implemented |
 | BE-25 | — (planned: `GET /users/me/export` GDPR JSON bundle, attachment delivery, dedicated 5/min rate limit, 50 MB size warning) | Docs complete; NOT implemented |
 | BE-26 | — (planned: `DELETE /conversations` bulk with streaming skip, `PATCH /conversations/{id}`, `PATCH /reading/highlights/{id}`, 200 highlights/page limit, delete-while-stream `409 CONVERSATION_BUSY`, migration `0007`) | Docs complete; NOT implemented |
+| BE-27 | — (planned: `admin_audit_logs` table + `GET /admin/audit-logs` (§9.6), `400 LAST_ADMIN_LOCKOUT`, `GET /admin/users` wildcard-safe `search`, telemetry `error_breakdown` counters, CLI promotion audit row; migration `0008`) | Docs complete; NOT implemented |
 
 ## Checks performed
 

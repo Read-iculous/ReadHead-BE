@@ -4,6 +4,7 @@ Implementation status: see `implementation-status.md`. Backend source for BE-01�
 BE-19 and BE-20 are newly added tasks documented in full but NOT yet implemented (docs complete; code pending).
 BE-21, BE-22 and BE-23 are newly added tasks documented in full but NOT yet implemented (docs complete; code pending) — BE-01→BE-20 are unchanged.
 BE-24, BE-25 and BE-26 are newly added tasks documented in full but NOT yet implemented (docs complete; code pending) — BE-01→BE-23 are unchanged.
+BE-27 is a newly added task documented in full but NOT yet implemented (docs complete; code pending) — BE-01→BE-26 are unchanged.
 
 This document defines the complete backend implementation roadmap derived from BRS, SRS, SyRS, OpsCon, and `.docs/`. Every task adheres to a standardized format: **Task Name**, **Description**, **Plan & Codebase**, **Acceptance Criteria**, and **Verification / Screenshot**.
 
@@ -63,6 +64,9 @@ Phase 13: Insights, Export & History Management Hardening (Features I, G extensi
   ├── [BE-24] Reading Stats & Comprehension Insights
   ├── [BE-25] Data Export (GDPR Bundle)
   └── [BE-26] Conversation Bulk Delete, Title Patch, Highlight Patch & Bookmark Cleanup
+
+Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
+  └── [BE-27] Admin Audit Logs, Last-Admin Lockout, User Search & Telemetry Error Breakdown
 ```
 
 ---
@@ -453,7 +457,7 @@ Phase 13: Insights, Export & History Management Hardening (Features I, G extensi
   - Banning/suspending a user updates PostgreSQL `users.status`, revokes all auth sessions and active refresh tokens with reason `security`, cleans session-indexed grace caches, and immediately sets `revoked_users:{user_id}` in Redis (TTL=3600s). Re-activating deletes the Redis key but never reopens revoked sessions.
   - Excessive requests hit rate limits with standard `429 Too Many Requests` headers; SSE endpoint limits active concurrency to max 2 streams.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_admin_portal.py -v`
+  - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py -v` (there is no `test_admin_portal.py`)
   - Screenshot: Swagger/Postman output showing `GET /api/v1/admin/telemetry` returning telemetry JSON and `PATCH /api/v1/admin/users/{id}/status` successfully banning an account.
 
 ---
@@ -654,3 +658,36 @@ Phase 13: Insights, Export & History Management Hardening (Features I, G extensi
 - **Verification / Screenshot**:
   - Test: new `tests/integration/test_conversation_bulk_delete.py` (bulk + streaming skip + tombstone pull, rename tombstone 404, delete-while-stream 409) and `tests/integration/test_highlight_edit_limits.py` (patch sync event, 200/page limit, duplicate allowance, migration roundtrip); push edge cases added to existing sync regression files.
   - Screenshot: Swagger UI showing bulk delete response `{deleted_count, skipped_streaming}` and the `422 VALIDATION_ERROR` for the 201st highlight; `\d reading_history` before/after migration `0007`.
+
+---
+
+## Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
+
+### [BE-27] Admin Audit Logs, Last-Admin Lockout, User Search & Telemetry Error Breakdown
+- **Feature Reference**: Web Management Portal, Feature L (`FR-OPS-01~05`); ADR-019, ADR-020; `.docs/api/endpoints.md` §9.1–§9.3, §9.5, §9.6; `.docs/database/schema.md` §2.16; migration `0008`; `.docs/api/error-codes.md` (`400 LAST_ADMIN_LOCKOUT`)
+- **Description**: Add an append-only admin audit trail (`admin_audit_logs`, migration `0008`) written by every status change, admin reset-link dispatch and CLI role promotion, exposed read-only via `GET /admin/audit-logs`; block suspending/banning the last active administrator (`400 LAST_ADMIN_LOCKOUT`); add a wildcard-safe `search` parameter to `GET /admin/users`; and extend the middleware telemetry minute bucket with `errors_429`/`errors_401`/`errors_504` counters surfaced as `error_breakdown` in §9.1 (overall `error_rate` unchanged). The 90-day retention cleanup job is **planned, not part of this task**; no frontend audit UI in the MVP (query via the endpoint or `psql`).
+- **Plan & Codebase**:
+  - `app/models/admin_audit.py`: `AdminAuditLog` model — `actor_user_id` FK -> `users.id` (ON DELETE CASCADE), nullable `target_user_id` FK -> `users.id` (ON DELETE SET NULL), `action VARCHAR(50)` (`user_status_changed`, `password_reset_link_sent`, `role_promoted_cli`, ...), `details JSONB DEFAULT '{}'`, nullable `request_id VARCHAR(64)`, `created_at`; indexes `(actor_user_id, created_at DESC)` and `(target_user_id)`.
+  - `alembic/versions/`: new revision `0008_admin_audit_and_user_search` (see `.docs/database/migrations.md`); ORM model updated before autogenerate; fully additive.
+  - `app/services/admin_service.py`: write one audit row inside the same transaction as each accepted `set_status` (`actor_user_id` = calling admin, `target_user_id`, `action = "user_status_changed"`, `details = {"old_status", "new_status"}`, `request_id` from the correlation context); implement the last-admin guard below.
+  - `app/routers/admin.py`:
+    - `PATCH /admin/users/{id}/status`: before applying suspend/ban, count active administrators excluding the target; if zero → `400 LAST_ADMIN_LOCKOUT` (error code registered in error-codes §2.2). Moderating other administrators proceeds normally and is audited.
+    - `GET /admin/users`: optional `search` query param — `ILIKE` over `email`/`full_name` with `%`, `_` and `\` escaped (pattern compiled against the raw, bound value; no string interpolation) so literal input is matched verbatim; composes with `status` under AND and with existing pagination counters.
+    - `GET /admin/audit-logs` (§9.6): paginated `{items, total, page, page_size, total_pages}` with optional `action` and `target_user_id` filters; protected by the existing `require_admin` dependency; general API bucket.
+  - `app/routers/auth.py` / reset-link path (lands with BE-19): on a successful `POST /admin/users/{id}/send-reset-link` dispatch, write one audit row with `action = "password_reset_link_sent"`.
+  - `app/cli/create_admin.py` (ADR-019, CLI-only role promotion): keep refusing to promote an existing account; on a successful admin bootstrap, insert one `admin_audit_logs` row directly (`action = "role_promoted_cli"`, `target_user_id` = the new account, `request_id = NULL`).
+  - `app/core/middleware.py`: extend the telemetry minute bucket with per-status counters `errors_429`, `errors_401`, `errors_504` alongside the unchanged total error rate; keep existing CORS/`Retry-After`/request-ID behavior for early `429` replies.
+  - `app/schemas/admin.py`: `TelemetryResponse` gains `error_breakdown: {rate_limit, unauthorized, upstream_timeout}`; `AdminAuditLogResponse`; `AdminUserListResponse` unchanged apart from accepting `search`.
+- **Acceptance Criteria**:
+  - Every accepted status change (suspend/ban/reactivate, including admin-on-admin) writes exactly one `admin_audit_logs` row with the correct actor, target, action and `{old_status, new_status}` details; the row is committed atomically with the status update (no orphan audit entries on failure).
+  - Suspending or banning the **last active administrator** returns `400 LAST_ADMIN_LOCKOUT` with no status change and no audit row; the same admin can still suspend/ban a *different* admin (change applied, audit row written). A second active admin can always be moderated.
+  - A user actively streaming is banned: the existing test scenario (ban stops the in-flight stream, no done event) continues to pass unchanged.
+  - `search` matches case-insensitive substrings of `email` and `full_name`; inputs containing `%`, `_` and `\` are matched literally (a test searches for the literal string `100%` and asserts no wildcard expansion); results compose with `status` and the pagination totals reflect the combined filter.
+  - `GET /admin/audit-logs` returns rows for the admin actor only to admins (non-admin → `403 FORBIDDEN_RESOURCE`); `action` and `target_user_id` filters work; results are ordered by `created_at DESC` with stable pagination.
+  - CLI role promotion via `python -m app.cli.create_admin` still refuses to elevate an existing account (ADR-019) and writes one `role_promoted_cli` audit row with `request_id = NULL` for the new admin.
+  - Telemetry response includes `error_breakdown` with `rate_limit`, `unauthorized` and `upstream_timeout` rates derived from the middleware minute-bucket counters, while the total `error_rate` equals the pre-existing value for identical traffic; `timeframe` semantics are unchanged.
+  - Retention: docs state the 90-day policy (schema §2.16, ADR-020); acceptance asserts only that no cleanup job ships in this task and expired rows are left in place until the planned job lands.
+  - Migration `0008` passes `alembic upgrade head` / `downgrade -1` / `upgrade head`; `admin_audit_logs` is absent after downgrade.
+- **Verification / Screenshot**:
+  - Test: new `tests/integration/test_admin_audit_trail.py` (audit rows per status change, last-admin lockout, admin-on-admin moderation, audit-log filters/pagination, CLI promotion audit row, search LIKE-escape, telemetry `error_breakdown`) and the ban-while-streaming regression re-run in `tests/integration/test_ai_quiz_oauth_admin.py`.
+  - Screenshot: Swagger UI showing `GET /admin/audit-logs` items with `old_status`/`new_status` details, the `400 LAST_ADMIN_LOCKOUT` body, and §9.1 telemetry JSON including `error_breakdown`; `\d admin_audit_logs` before/after migration `0008`.
