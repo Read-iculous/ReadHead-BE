@@ -10,7 +10,12 @@ from app.models.user_setting import UserSetting
 
 
 def enforce(
-    settings: UserSetting, url: str, text: str, bypass: bool = False, *, audit: bool = True
+    settings: UserSetting,
+    url: str,
+    text: str,
+    bypass: bool = False,
+    *,
+    audit: bool = True,
 ) -> None:
     """Inspect all outbound context before a provider sees any user material."""
     if blocked(url, settings.blacklisted_domains):

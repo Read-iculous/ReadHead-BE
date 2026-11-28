@@ -1,5 +1,6 @@
 """Request correlation, asynchronous limits and content-free telemetry."""
 
+import contextvars
 import time
 from uuid import uuid4
 
@@ -71,6 +72,7 @@ class OperationalMiddleware:
         started = time.monotonic()
         status = 500
         path = scope.get("path", "")
+        user_token: contextvars.Token[str | None] | None = None
 
         async def dispatch() -> None:
             """Keep early rate-limit responses inside correlation and telemetry."""
@@ -131,17 +133,13 @@ class OperationalMiddleware:
             await send(message)
 
         context_token = request_id_context.set(request_id)
-        user_token = None
         try:
             await dispatch()
         finally:
             request_id_context.reset(context_token)
             if user_token is not None:
                 user_id_context.reset(user_token)
-            if (
-                path.startswith("/api/v1/")
-                and not path.startswith("/api/v1/health")
-            ):
+            if path.startswith("/api/v1/") and not path.startswith("/api/v1/health"):
                 try:
                     key = f"metrics:{int(time.time()//60)}"
                     async with redis.client.pipeline(transaction=True) as pipe:
