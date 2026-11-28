@@ -276,3 +276,17 @@
 - **Consequences**:
   - *Pros*: Durable accountability for every status change and promotion; simple additive migration; queryable without UI; retention is bounded by policy.
   - *Cons*: 90-day retention is unenforced until the cleanup job lands; accountability depends on the table actually being written by every future admin action (a review rule, not an enforcement mechanism); no UI means ad-hoc `psql` access for operators.
+
+---
+
+## ADR-021: MVP Decision Set — Language List, Mixed-Sensitive Handling, Token TTLs (approved 2026-11-29)
+- **Status**: Accepted (approved 2026-11-29)
+- **Context**: The project lead finalized three previously open MVP questions on 2026-11-29: (a) the supported translation language list, which had only been used implicitly across `.docs/api/endpoints.md` and `.docs/api/error-codes.md` without formal approval; (b) how to handle an outbound request that contains both sensitive and non-sensitive content in the Feature H pre-flight check; and (c) the token TTLs planned under BE-19.
+- **Decision**:
+  1. **Supported translation language list is final**: `vi, en, ja, zh, ko, fr, de, es`. These eight languages were previously used implicitly across `.docs/api/endpoints.md` and `.docs/api/error-codes.md`; they are now formally approved. Extending the list requires a BRS revisit. `ui_language` remains `{vi, en}`.
+  2. **Requests containing both sensitive and non-sensitive content are blocked in their entirety** (`400 SENSITIVE_DATA_DETECTED`): there is no partial-allow or auto-sanitize mechanism in the MVP. The user must edit/remove the sensitive parts and manually resend. This aligns with FR-SEC-06 and the existing check-sensitive flow, and no auto-resubmission is performed (FR-SEC-08; consistent with ADR-009's no-silent-retry rule).
+  3. **Token TTLs (BE-19)**: email verification tokens last **24 hours**; password reset tokens last **30 minutes** (this supersedes the 60-minute reset value noted in ADR-015 and `.docs/technical/environment-variables.md`, whose table is to be updated when BE-19 lands). Admin audit-log retention stays **90 days** (ADR-020).
+- **Consequences**:
+  - *Language list*: adding a new translation language later is a contract change (settings and `target_language` validation, `400 UNSUPPORTED_LANGUAGE`) plus FE i18n work — not a configuration toggle.
+  - *Mixed content*: block-all favors safety over UX — the whole request is rejected even when only a fragment is sensitive, and the user must manually edit and resend; nothing is transmitted to providers without explicit user action.
+  - *TTLs*: 24h verification / 30-minute reset are environment-configurable defaults (`VERIFICATION_TOKEN_TTL_HOURS`, `PASSWORD_RESET_TOKEN_TTL_MINUTES`); audit-log retention remains bounded at 90 days per ADR-020.

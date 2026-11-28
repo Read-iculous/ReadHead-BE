@@ -1,5 +1,7 @@
 # API Endpoints Specification
 
+> **Planned items**: Contract details or sections carrying a `BE-xx` label (e.g. "planned — BE-19") are **planned but NOT yet implemented**. See `.docs/development/implementation-status.md` for the actual implementation status.
+
 Base URL: `/api/v1`
 
 Text destined for PostgreSQL TEXT/VARCHAR/JSONB, including URL/search query parameters, must be valid UTF-8 Unicode without NUL (`U+0000`). Invalid request text returns `422 VALIDATION_ERROR` with the field location before persistence; it is rejected rather than silently stripped. Invalid text inside sync mutations returns `400 INVALID_SYNC_MUTATION` and rolls back the entire batch. Invalid provider-generated persistent content is an upstream error (`UPSTREAM_AI_ERROR`), not a client validation or database error.
@@ -7,6 +9,23 @@ Text destined for PostgreSQL TEXT/VARCHAR/JSONB, including URL/search query para
 Unsupported provider strings (body `provider`, settings `default_provider`, and provider route parameters) return `400 UNSUPPORTED_PROVIDER`. Missing required fields, wrong types and unrelated enum validation remain `422 VALIDATION_ERROR`; malformed JSON, including invalid byte encoding, remains `400 INVALID_JSON`.
 
 Backend routes are implemented in `app/routers/`; generated `/openapi.json` describes the current Pydantic request/response schemas. Verification status and client-only responsibilities: `.docs/development/implementation-status.md`.
+
+### Framework-level error codes (not tied to a specific endpoint)
+
+The following codes are produced by shared middleware/dependencies rather than any single endpoint, so they can appear on any route:
+
+- `401 TOKEN_EXPIRED` — access token expired, returned by the authentication dependency; the client refreshes and retries.
+- `403 ACCOUNT_INACTIVE` — reserved code, currently unused; it duplicates the meaning of `401 USER_SUSPENDED` (see error-codes §2.1).
+- `404 NOT_FOUND` — unmatched route (no endpoint registered at the requested path).
+- `500 DATABASE_ERROR` — database connection or execution failure.
+- `500 ENCRYPTION_ERROR` — key decryption failure (invalid master key).
+- `503 DEPENDENCY_UNHEALTHY` — hard dependency failure; the health probes surface the same condition (§1.1).
+
+Additionally, `413 Payload Too Large` is the responsibility of the deployment/reverse proxy (e.g. nginx `client_max_body_size`), not of application code — there is no ASGI middleware returning `413` (ISSUE-038).
+
+### Long synchronous requests & client disconnects
+
+Long-running synchronous requests (export §3.7, quiz generate §6.1, bulk delete §7.3a, POST history §7.4) have no job/queue: if the client disconnects mid-request, the server either completes the work or aborts it safely — there is no partial state. Client retry semantics per case: bulk delete re-runs are idempotent (already-tombstoned conversations are not counted again, §7.3a); export is a pure read, so retrying is harmless; quiz generate may create a new unsubmitted quiz row on retry (the abandoned one simply stays unsubmitted and expires per §6.2); POST history has no idempotency key, so a retry re-submits the same payload and records the visit again.
 
 ### CORS and rate-limit responses
 
@@ -116,6 +135,7 @@ Backend routes are implemented in `app/routers/`; generated `/openapi.json` desc
   }
   ```
 - **Error codes**: `409 EMAIL_ALREADY_EXISTS` (duplicate), `422 VALIDATION_ERROR` (password out of 8–72 bytes, NUL, or email invalid/over 255 normalized characters).
+- **Status**: The email-verification gate and the `verification_email_sent` field described above are planned — BE-19; not yet implemented (see `implementation-status.md`).
 
 ### 2.2 POST `/api/v1/auth/login`
 - **Description**: Authenticate with email and password. Accounts with `is_verified = FALSE` are BLOCKED before session issuance.
@@ -144,6 +164,7 @@ Backend routes are implemented in `app/routers/`; generated `/openapi.json` desc
     }
   }
   ```
+- **Status**: the `403 EMAIL_NOT_VERIFIED` login gate described above is planned — BE-19; not yet implemented.
 
 ### 2.3 POST `/api/v1/auth/oauth/google`
 - Provider responses are validated before account lookup/writes: bounded string subject/email, explicit verified flag, numeric expiry, matching audience and trusted issuer. Malformed identity payloads return `401 TOKEN_INVALID`, never a database/attribute error.
@@ -318,6 +339,8 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
   }
   ```
 
+- **Status**: the `ui_language` and `personalization_consent` fields in this response are planned — BE-23 (enum validation for `ui_language` is BE-21); not yet implemented.
+
 ### 3.4 PATCH `/api/v1/users/me/settings`
 - **Description**: Update user preferences or accessibility settings. Requires optimistic version lock.
 - **Auth**: Required
@@ -332,7 +355,34 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
   - Takes effect immediately: the flag is re-read under the user row lock before any personalization use (ISSUE-015 pattern, ADR-017).
   - The field is part of the synchronized `settings` entity (§8), so revocation propagates to all devices.
 - Domain blacklist matching normalizes hosts and patterns to IDNA and strips the DNS root dot after conversion. Unicode root-dot forms U+3002 / U+FF0E / U+FF61 cannot bypass a blocked hostname; wildcard semantics are preserved.
+- **Status**: the `400 UNSUPPORTED_LANGUAGE` validation for `ui_language`/`target_language` is planned — BE-21; not yet implemented.
 - **Response**: `200 OK` (Updated settings object with incremented version)
+  ```json
+  {
+    "data": {
+      "id": "b3c639fa-3d6a-4d8f-a4d3-ad10456789ab",
+      "default_provider": "gemini",
+      "default_model": "gemini-1.5-flash",
+      "target_language": "vi",
+      "explanation_level": "standard",
+      "accessibility_profile": {
+        "dyslexia_font": true,
+        "font_size_delta": 2,
+        "line_spacing": 1.6,
+        "bionic_reading": false,
+        "high_contrast": false
+      },
+      "proactive_assistance_enabled": true,
+      "proactive_sensitivity": "medium",
+      "data_protection_mode": true,
+      "privacy_mode_enabled": false,
+      "blacklisted_domains": ["*.bank.com", "internal.corp"],
+      "version": 2,
+      "updated_at": "2026-11-21T00:05:00Z"
+    }
+  }
+  ```
+  Shape per `UserSettingResponse` in `app/schemas/responses.py`; the planned `ui_language`/`personalization_consent` fields (§3.3 status) are added by BE-21/BE-23.
 
 ### 3.5 PATCH `/api/v1/users/me` (Profile & Email Change — BE-19)
 - **Description**: Update profile fields. `full_name` (display name) is a simple write. Changing `email` is a verified transition:
@@ -350,6 +400,22 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
   }
   ```
 - **Response**: `200 OK` (Updated profile; includes `email` (pending new one when changing), `is_verified` and `verification_email_sent` when an email change was requested)
+  ```json
+  {
+    "data": {
+      "id": "c8a417df-1b4e-4b6e-a2b1-8b9f12345678",
+      "email": "user@example.com",
+      "full_name": "John Doe",
+      "avatar_url": null,
+      "role": "user",
+      "status": "active",
+      "is_verified": true,
+      "created_at": "2026-11-21T00:00:00Z",
+      "linked_accounts": ["google"]
+    }
+  }
+  ```
+  Base shape per `UserResponse` in `app/schemas/responses.py` (plain profile update shown; the email-change extras above are BE-19 behavior).
 - **Error codes**: `401 INVALID_CREDENTIALS`, `409 EMAIL_ALREADY_EXISTS`, `422 VALIDATION_ERROR`.
 
 ### 3.6 GET `/api/v1/users/me/usage` (AI Usage Tracking — BE-20)
@@ -475,6 +541,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
     "set_active": true
   }
   ```
+- **Field bounds**: `api_key` accepts 8–4096 characters (non-empty beyond that minimum) per `app/schemas/api_key.py`; values outside the bound return `422 VALIDATION_ERROR`.
 - **Response**: `201 Created` `{"data": {"provider": "openai", "key_hint": "sk-...keyh", "is_active": true}}`
 
 ### 4.3 DELETE `/api/v1/api-keys/{provider}`
@@ -492,6 +559,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
   - The provider could not be reached (network failure, timeout, 5xx) → `502 UPSTREAM_AI_ERROR` with detail `"provider unreachable"` — this is an infrastructure/upstream fault, NOT evidence that the key is bad, and must not deactivate the key.
 - **Auth**: Required
 - **Response**: `200 OK` `{"data": {"valid": true, "message": "Key validated successfully"}}`
+- **Error codes**: `400 KEY_VALIDATION_FAILED` (provider responded and rejected the key), `502 UPSTREAM_AI_ERROR` (detail `"provider unreachable"`), `502 UPSTREAM_QUOTA_EXCEEDED` (the user's provider quota/credit is exhausted — distinct from ReadHead's own `429 RATE_LIMIT_EXCEEDED` server limiter, ISSUE-005) and `504 UPSTREAM_AI_TIMEOUT` (provider did not respond in time, ISSUE-013).
 
 ---
 
@@ -499,7 +567,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 
 ### 5.1 POST `/api/v1/ai/check-sensitive` (Feature H Pre-flight Check)
 - **Description**: Pre-flight inspection for sensitive credentials or PII across 100% of outbound text before sending to AI.
-- **Mixed-content policy for `page_content` (ADR-006 scope note)**: `page_content` carries the full extracted article text and is treated as potentially containing sensitive data mixed with ordinary reading content. When the pre-flight scan detects sensitive content inside `page_content`, the request is **blocked by default** (`400 SENSITIVE_DATA_DETECTED`). Because `page_content` is supplied wholesale by the client — the backend never re-extracts or edits the page, and the client cannot strip individual findings without destroying the reading context the AI needs — the **override via `bypass_protection: true` is the only path to proceed**. The override MUST follow the existing mechanism: the client shows a strong explicit user confirmation first, and the confirmed override is audit-logged (`sensitive_content_override_confirmed`, one log line per request with request ID and masked user ID — ISSUE-041). There is no domain whitelist: the domain blacklist (`DOMAIN_BLOCKED_BY_PRIVACY`) remains the only domain-level control and is not bypassable by `bypass_protection`.
+- **Mixed-content policy for `page_content` (ADR-006 scope note)**: `page_content` carries the full extracted article text and is treated as potentially containing sensitive data mixed with ordinary reading content. When the pre-flight scan detects sensitive content inside `page_content`, the request is **blocked by default** (`400 SENSITIVE_DATA_DETECTED`). Because `page_content` is supplied wholesale by the client — the backend never re-extracts or edits the page, and the client cannot strip individual findings without destroying the reading context the AI needs — the **override via `bypass_protection: true` is the only path to proceed**. The override MUST follow the existing mechanism: the client shows a strong explicit user confirmation first, and the confirmed override is audit-logged (`sensitive_content_override_confirmed`, one log line per request with request ID and masked user ID — ISSUE-041). There is no domain whitelist: the domain blacklist (`DOMAIN_BLOCKED_BY_PRIVACY`) remains the only domain-level control and is not bypassable by `bypass_protection`. **Policy confirmation (ADR-021, approved 2026-11-29)**: a request containing both sensitive and non-sensitive content is blocked in its entirety — there is no partial-allow or auto-sanitize mechanism in the MVP; unless the user takes the explicit override above, they must edit/remove the sensitive parts and manually resend (no auto-resubmission, FR-SEC-08).
 - **Auth**: Required
 - **Request Body**: `{"text": "Text snippet to inspect..."}`
 - **Response**: `200 OK`
@@ -520,7 +588,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 - **Headers**: `Accept: text/event-stream`
 - **Language & Translation Behavior**:
   - `target_language` is optional and per-request: when supplied for `task: "translate"` it overrides the user's `target_language` setting for this request only; when omitted, the stored settings value is the fallback. The user's settings value is never modified by a per-request override.
-  - Supplied `target_language` values are validated against the same supported set as settings (`vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es`); an unsupported value returns `400 UNSUPPORTED_LANGUAGE` before any LLM dispatch. There is no `source_language` parameter: the source language is auto-detected from the submitted text by the model.
+  - Supplied `target_language` values are validated against the same supported set as settings (`vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es`); an unsupported value returns `400 UNSUPPORTED_LANGUAGE` before any LLM dispatch. There is no `source_language` parameter: the source language is auto-detected from the submitted text by the model. (Validation of the 8 supported languages here is planned — BE-21; not yet implemented.)
   - The translate task is prompt-level behavior: the system prompt instructs the model to **translate AND explain the meaning of domain/technical terms in context** (BR-05). The response remains a plain streamed text answer (`event: token`) — no separate terminology payload, schema or endpoint is involved.
 - **Tab Context & Isolation**:
   - If `conversation_id` is supplied, server verifies ownership, active session binding and that the conversation is not soft-deleted. For an existing standard-mode conversation, both stored and requested `reading_session_id` must be non-null and equal; two null values do not constitute a binding. Otherwise return `400 TAB_CONTEXT_MISMATCH` before writing a message or acquiring a stream slot.
@@ -584,6 +652,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 - **Error, Suspension & Disconnect Handling**:
   - If an upstream error occurs, the stream emits `event: error` and closes immediately. **No `done` event is sent after `error`**.
   - **Mid-stream provider auth errors**: If the provider rejects the stored user key during streaming (401/403-class upstream response), the stream emits `event: error` with code `403 UPSTREAM_KEY_INVALID` — a distinct code from `UPSTREAM_AI_ERROR` so the client can route the user to key management instead of showing a generic AI failure. The stream closes without `done`; the key is not auto-deleted.
+  - **Upstream quota & timeout**: Provider quota/credit exhaustion is caught by the adapter error mappers and surfaces as `502 UPSTREAM_QUOTA_EXCEEDED` — distinct from ReadHead's server-level `429 RATE_LIMIT_EXCEEDED` limiter (ISSUE-005); a provider that takes too long to begin streaming surfaces `504 UPSTREAM_AI_TIMEOUT` (ISSUE-013). Both close the stream with `event: error` and never emit `done`.
   - **In-Flight Cancellation**: Async generator inspects Redis key `revoked_users:{user_id}` on each token iteration. If user is banned/deleted mid-stream, stream terminates with `event: error` (`USER_SUSPENDED`); a `revoked_sessions:{sid}` marker from logout terminates that session stream with `UNAUTHORIZED`. Checks run between tokens in normal Redis operation. These explicit revocation markers are the ONLY mid-stream cancellation triggers: an access token merely expiring, or a failed revocation check, never cuts a running stream.
     - Suspension/ban also marks every revoked auth session. Reactivation clears only the user marker, preserving the per-session markers so old streams cannot resume. Check revocation again after the upstream ends, before emitting citations/persisting/done. A new login uses a new session and is unaffected by old session markers.
   - **Redis Downtime mid-stream**: If Redis becomes unreachable during streaming, the generator logs a warning, skips in-flight cancellation checks, and delivers the stream to completion.
@@ -625,7 +694,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
     }
   }
   ```
-- **Insight-driven enrichment (Comprehension Insight, ADR-018 — optional field)**: The response MAY include an optional `insight` object `{domain_difficulty, suggested_action}` when the backend's on-the-fly per-domain aggregate (computed exactly like `GET /users/me/reading-insights`, §3.8) indicates elevated difficulty for the current domain. Rules:
+- **Insight-driven enrichment (Comprehension Insight, ADR-018 — optional field, planned — BE-24)**: The response MAY include an optional `insight` object `{domain_difficulty, suggested_action}` when the backend's on-the-fly per-domain aggregate (computed exactly like `GET /users/me/reading-insights`, §3.8) indicates elevated difficulty for the current domain. **The `insight` field itself is planned — BE-24 and not yet implemented**; the plain hint behavior above is implemented. Rules:
   - **Consent gate**: `insight` is added **ONLY** when `personalization_consent == true`, re-read under the user row lock at request time (ADR-017). Without consent the field is never present — the plain hint still works, since it does not use personal data.
   - **Daily cap**: insight enrichment is capped at **2 per day per domain** (configurable; Redis counter with 24h TTL). When the cap is reached, `insight` is omitted but the ordinary hint still functions per the existing dedup rules.
   - **Dismissal memory**: If the user dismisses this insight-type suggestion, a Redis TTL cache (24h) suppresses further insight enrichment for that (user, domain) — separate from the 5-minute paragraph dedup cache, which continues to govern the plain hint.
@@ -637,6 +706,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 - **Rate limit**: Covered by the **general API bucket** (`API_REQUESTS_PER_MINUTE`, 120/min per identity) — feedback performs no generation, so it is not counted against the AI bucket.
 - **Validation**: `rating` must be `helpful` | `unhelpful` and `report_reason` (when supplied) must be `inaccurate` | `hallucination` | `harmful` | `other`; any other value returns `422 VALIDATION_ERROR` with the offending field attributed.
 - **Privacy Mode note**: Private-mode messages are ephemeral (never persisted), so a feedback POST referencing an ephemeral message cannot satisfy the `ai_feedback.message_id` FK. The endpoint re-checks persistence state and returns `404 MESSAGE_NOT_FOUND` rather than attempting the write — the client should not offer feedback UI for private-mode responses.
+- **Anti-enumeration**: A message belonging to another user and a non-existent message both return `404 MESSAGE_NOT_FOUND` (never `403 FORBIDDEN_RESOURCE`) — ownership failures are indistinguishable from absence.
 - **Auth**: Required (Message must belong to a conversation owned by the authenticated user)
 - **Duplicate Handling**: Submitting feedback again for the same `(user_id, message_id)` atomically updates the existing rating.
 - **Request Body**:
@@ -706,6 +776,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
     }
   }
   ```
+- **Error codes**: `422 UNREPRESENTATIVE_SOURCE` when the source text is too short or otherwise insufficient to ground a representative quiz (minimum 20 whitespace-delimited source words; BE-12, `FR-CMP-04`) — the backend never hallucinates questions from an unrepresentative source (error-codes §2.6).
 
 ### 6.2 POST `/api/v1/quiz/{quiz_id}/submit`
 - **Answer types**: Option indices must be JSON integers. Booleans, numeric strings and floating-point values return `422 VALIDATION_ERROR` before an attempt is graded. Generated question IDs and correct-option indices are also validated without numeric coercion.
@@ -891,6 +962,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 
 ### 7.4 POST `/api/v1/reading/history`
 - **Description**: Record a read article with dwell time and optional cached summary.
+- **URL bound**: `page_url` accepts at most **8,192 characters** (`PageSource.page_url`, `app/schemas/common.py`; schema §2.8 + ISSUE-034) — longer values return `422 VALIDATION_ERROR`.
 - **Auth**: Required
 - **Request Body**:
   ```json
@@ -931,6 +1003,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
 
 ### 7.7 POST `/api/v1/reading/highlights`
 - **Description**: Save selected text passage and optional personal note.
+- **URL bound**: `page_url` accepts at most **8,192 characters** (`PageSource.page_url`, `app/schemas/common.py`; schema §2.8 + ISSUE-034) — longer values return `422 VALIDATION_ERROR`.
 - **Per-page limit**: A page may hold at most **200 highlights**. When the count of non-deleted highlights for the same `page_url` already reaches 200, the request returns `422 VALIDATION_ERROR` with `field="page_url"` (the existing count is reported in the error detail). No new error code is introduced. Duplicated highlight text on a page is **allowed** — no dedup is applied.
 - **Auth**: Required
 - **Request Body**:
@@ -1220,6 +1293,7 @@ All four endpoints share anti-enumeration discipline: responses never reveal whe
   - **Last-admin protection (planned — BE-27)**: suspending or banning the **last active administrator** is rejected with `400 LAST_ADMIN_LOCKOUT`. Admins can still moderate other administrators normally (with an audit entry).
   - **Ban / Suspend**: Sets PostgreSQL `users.status = status` and matching `is_active`, revokes all user auth sessions and active refresh tokens in DB (`security` reason), cleans their session-indexed grace caches, and sets Redis marker `revoked_users:{user_id} = status` (TTL = 3600s) for immediate session invalidation.
   - **Reactivate (`active`)**: Sets `users.status = 'active'`, `is_active = TRUE`, and deletes `revoked_users:{user_id}` from Redis. Existing revoked sessions remain revoked; sign in again.
+  - **Redis outage**: Publishing `revoked_users:{user_id}` / `revoked_sessions:{sid}` is best-effort — during a Redis outage the markers may be absent, but DB user/session revocation stays authoritative for every new request, and in-flight streams skip Redis cancellation checks per ADR-010 (auth-flow §2.5).
   - **Audit (planned — BE-27)**: every accepted status change writes one `admin_audit_logs` row (`actor_user_id` = calling admin, `target_user_id`, `action` = `user_status_changed`, `details` = `{old_status, new_status}`) — see §9.6.
 - **Auth**: Required (Role `admin`)
 - **Request Body**: `{"status": "suspended"}` // "active" | "suspended" | "banned"

@@ -38,17 +38,17 @@ All non-2xx responses from ReadHead-BE follow the standardized JSON structure:
 | `400` | `CANNOT_MODIFY_SELF_STATUS` | Administrators cannot suspend, ban, or alter their own account status |
 | `400` | `LAST_ADMIN_LOCKOUT` | Suspending or banning the **last active administrator** is rejected (`PATCH /admin/users/{id}/status`, planned — BE-27). Moderating other administrators remains allowed; the last admin must always be able to act on everyone else |
 | `400` | `QUIZ_ALREADY_SUBMITTED` | Quiz has already been submitted and graded; submitted quizzes cannot be retaken (no retry/reset path) |
-| `400` | `UNSUPPORTED_LANGUAGE` | Unsupported language value: `ui_language` outside `{vi, en}` in `PATCH /users/me/settings`, or `target_language` outside the supported translation set (`vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es`) in settings PATCH or `POST /ai/stream` |
+| `400` | `UNSUPPORTED_LANGUAGE` | Unsupported language value: `ui_language` outside `{vi, en}` in `PATCH /users/me/settings`, or `target_language` outside the supported translation set (`vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es`) in settings PATCH or `POST /ai/stream` (planned — BE-21) |
 | `409` | `EMAIL_ALREADY_EXISTS` | Registration email already registered (also `PATCH /users/me` email change) |
 
-#### Email Verification & Password Reset (`400` — Feature A, BE-19)
-Token semantics: unknown/already-consumed → `*_INVALID`; known-but-past-expiry → `*_EXPIRED`. Plaintext tokens exist only in email links; the database stores SHA-256 hashes only.
+#### Email Verification & Password Reset (`400` — Feature A, planned — BE-19)
+Token semantics: unknown/already-consumed → `*_INVALID`; known-but-past-expiry → `*_EXPIRED`. Plaintext tokens exist only in email links; the database stores SHA-256 hashes only. **All four codes below are planned — BE-19; not yet implemented.**
 | HTTP Status | Error Code | Description |
 |---|---|---|
-| `400` | `VERIFICATION_TOKEN_EXPIRED` | Verification token known but past its 24h TTL (`POST /auth/verify-email`); user must request a resend |
-| `400` | `VERIFICATION_TOKEN_INVALID` | Verification token unknown or already consumed (single use) (`POST /auth/verify-email`) |
-| `400` | `RESET_TOKEN_EXPIRED` | Password reset token known but past its 60-minute TTL (`POST /auth/reset-password`); user must request a new link |
-| `400` | `RESET_TOKEN_INVALID` | Password reset token unknown or already consumed (single use) (`POST /auth/reset-password`) |
+| `400` | `VERIFICATION_TOKEN_EXPIRED` | Verification token known but past its 24h TTL (`POST /auth/verify-email`); user must request a resend (planned — BE-19) |
+| `400` | `VERIFICATION_TOKEN_INVALID` | Verification token unknown or already consumed (single use) (`POST /auth/verify-email`) (planned — BE-19) |
+| `400` | `RESET_TOKEN_EXPIRED` | Password reset token known but past its 60-minute TTL (`POST /auth/reset-password`); user must request a new link (planned — BE-19) |
+| `400` | `RESET_TOKEN_INVALID` | Password reset token unknown or already consumed (single use) (`POST /auth/reset-password`) (planned — BE-19) |
 
 ### 2.3 Not Found (`404`)
 | HTTP Status | Error Code | Description |
@@ -57,7 +57,7 @@ Token semantics: unknown/already-consumed → `*_INVALID`; known-but-past-expiry
 | `404` | `USER_NOT_FOUND` | User entity not found |
 | `404` | `API_KEY_NOT_FOUND` | No API key found for requested provider |
 | `404` | `CONVERSATION_NOT_FOUND` | Conversation session ID not found |
-| `404` | `MESSAGE_NOT_FOUND` | Message ID not found. Also returned by `POST /ai/feedback` for a Privacy-Mode ephemeral message (never persisted, so the `ai_feedback.message_id` FK target does not exist) |
+| `404` | `MESSAGE_NOT_FOUND` | Message ID not found. Also returned by `POST /ai/feedback` for a Privacy-Mode ephemeral message (never persisted, so the `ai_feedback.message_id` FK target does not exist), and for a message belonging to another user — ownership failures and absence are indistinguishable (anti-enumeration, BE-15) |
 | `404` | `HIGHLIGHT_NOT_FOUND` | Highlight ID not found, unowned, or already tombstoned (also for `PATCH /reading/highlights/{id}` edits) |
 | `404` | `QUIZ_NOT_FOUND` | Quiz ID not found, belongs to another user, or was tombstoned. Also covers ephemeral Privacy-Mode quizzes whose Redis cache entry has expired (30-minute TTL) — expiry is indistinguishable from absence |
 

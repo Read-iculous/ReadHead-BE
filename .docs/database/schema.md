@@ -81,14 +81,14 @@ User-level configuration, accessibility profile, proactive assistance, and priva
 | `default_provider` | `VARCHAR(50)` | NO | `'gemini'` | Default AI provider |
 | `default_model` | `VARCHAR(100)` | NO | `'gemini-1.5-flash'` | Default AI model name |
 | `target_language` | `VARCHAR(10)` | NO | `'vi'` | Preferred translation language; one of `vi`, `en`, `ja`, `zh`, `ko`, `fr`, `de`, `es` |
-| `ui_language` | `VARCHAR(10)` | NO | `'vi'` | Extension UI language: `vi` or `en`; governs interface text only, separate from translation |
+| `ui_language` | `VARCHAR(10)` | NO | `'vi'` | Extension UI language: `vi` or `en`; governs interface text only, separate from translation (planned — BE-23 column, BE-21 enum validation; migration `0006` not yet implemented) |
 | `explanation_level` | `VARCHAR(20)` | NO | `'standard'` | `simple`, `standard`, `expert` |
 | `accessibility_profile` | `JSONB` | NO | `'{"dyslexia_font": false, "font_size_delta": 0, "line_spacing": 1.5, "bionic_reading": false, "high_contrast": false}'` | Accessibility & page styling preferences (BG-06, BR-11) |
 | `proactive_assistance_enabled`| `BOOLEAN` | NO | `TRUE` | Whether to suggest tips on reading slowdowns (Feature G) |
 | `proactive_sensitivity` | `VARCHAR(20)` | NO | `'medium'` | `low`, `medium`, `high` |
 | `data_protection_mode` | `BOOLEAN` | NO | `TRUE` | Feature H: Block sensitive PII/secrets outbound by default |
 | `privacy_mode_enabled` | `BOOLEAN` | NO | `FALSE` | Global toggle to prevent reading history logs (see Privacy Mode Matrix below) |
-| `personalization_consent` | `BOOLEAN` | NO | `FALSE` | ADR-017 opt-in for using `reading_history`/AI interactions for personalization; independent of `privacy_mode_enabled`; revocation sets FALSE without deleting stored data; re-read under the user lock before any personalization use |
+| `personalization_consent` | `BOOLEAN` | NO | `FALSE` | ADR-017 opt-in for using `reading_history`/AI interactions for personalization; independent of `privacy_mode_enabled`; revocation sets FALSE without deleting stored data; re-read under the user lock before any personalization use (planned — BE-23; migration `0006` not yet implemented) |
 | `blacklisted_domains` | `JSONB` | NO | `'[]'` | List of domain patterns to ignore (Domain Blacklist Policy; no domain whitelist exists — blacklist is the only domain-level control) |
 | `version` | `INTEGER` | NO | `1` | Optimistic lock version for multi-device sync (Feature J) |
 | `updated_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Last settings update |
@@ -145,7 +145,7 @@ Browsed pages and reading session logs (subject to privacy mode).
 | `cached_summary` | `TEXT` | YES | NULL | Pre-generated summary if created |
 | `reading_time_seconds` | `INTEGER` | NO | `0` | Estimated dwell/reading duration |
 | `visited_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Visit timestamp |
-*(Index on `[user_id, visited_at DESC]`. The former `is_bookmarked` flag has been dropped — revision `0007_drop_reading_history_bookmark`; bookmarks are not a backend feature.)*
+*(Index on `[user_id, visited_at DESC]`. The `is_bookmarked` flag is **still present in the current schema** (`app/models/reading_history.py`) — dropping it is planned — BE-26 (revision `0007_drop_reading_history_bookmark`; docs complete, NOT yet implemented, no migration file exists). Bookmarks are not a backend feature.)*
 
 ### 2.9 `highlights` (Feature I)
 User-saved text selections and personal notes. Synchronized across devices.
@@ -169,12 +169,12 @@ Stores generated quizzes, user responses, and score history. Serves the quiz-his
 | `id` | `UUID` | NO | `gen_random_uuid()` | Primary Key |
 | `user_id` | `UUID` | NO | — | FK -> `users.id` (ON DELETE CASCADE) |
 | `page_url` | `TEXT` | NO | — | URL quiz was based on |
-| `page_title` | `VARCHAR(500)` | YES | NULL | Title of the page the quiz was based on (denormalized for history display; NULL for legacy rows) |
+| `page_title` | `VARCHAR(500)` | YES | NULL | Title of the page the quiz was based on (denormalized for history display; NULL for legacy rows) (planned — BE-22; migration `0006` not yet implemented) |
 | `questions_payload`| `JSONB` | NO | — | List of question objects, options, correct index. `total_questions` is derived from this JSONB array length — no dedicated column |
 | `user_answers` | `JSONB` | YES | NULL | User's submitted option indices |
 | `score` | `INTEGER` | YES | NULL | Points scored (e.g. 4/5) |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Quiz generation timestamp |
-| `submitted_at` | `TIMESTAMPTZ` | YES | NULL | Grading/submission timestamp; NULL for generated-but-unsubmitted quizzes (`is_submitted: false` in history responses) |
+| `submitted_at` | `TIMESTAMPTZ` | YES | NULL | Grading/submission timestamp; NULL for generated-but-unsubmitted quizzes (`is_submitted: false` in history responses) (planned — BE-22; migration `0006` not yet implemented) |
 
 ### 2.11 `ai_feedback` (BR-15 — Evaluation & User Feedback)
 User ratings and error reports on AI responses.
@@ -207,7 +207,7 @@ One login/OAuth session owns an entire refresh-token chain. It is distinct from 
 
 All authenticated requests validate session ownership, expiry and revocation in PostgreSQL. Grace-cache lookup is never a replacement for this check. See `.docs/technical/auth-flow.md` for locking, cleanup and temporary refresh failure behavior.
 
-### 2.13 `email_verification_tokens` (Feature A — Mandatory Email Verification)
+### 2.13 `email_verification_tokens` (Feature A — Mandatory Email Verification; planned — BE-19, migration `0004` not yet implemented)
 Single-use hashed tokens sent via Resend to verify a user's email address before login is permitted. The plaintext token exists only inside the emailed link: the database stores exclusively its SHA-256 hex digest. Tokens are generated with 256-bit URL-safe entropy (`secrets.token_urlsafe(32)`).
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -217,9 +217,9 @@ Single-use hashed tokens sent via Resend to verify a user's email address before
 | `expires_at` | `TIMESTAMPTZ` | NO | — | Expiration timestamp (`VERIFICATION_TOKEN_TTL_HOURS`, default 24h); expired tokens return `400 VERIFICATION_TOKEN_EXPIRED` |
 | `used_at` | `TIMESTAMPTZ` | YES | NULL | Set when the token is consumed; a used token cannot be replayed |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Token issuance timestamp |
-*(Unique `token_hash`; indexes on `(user_id)` and `(token_hash)`. Verification compares hashes with `secrets.compare_digest`. Stale/expired rows may be purged by a maintenance job; deletion does not affect verified users.)*
+*(Unique `token_hash`; indexes on `(user_id)` and `(token_hash)`. Verification compares hashes with `secrets.compare_digest`. Stale/expired rows may be purged by a maintenance job — note: **no such maintenance job exists in the code yet** (only manual CLI cleanup; the ADR-020 cleanup job is deferred); deletion does not affect verified users.)*
 
-### 2.14 `password_reset_tokens` (Feature A — Password Reset)
+### 2.14 `password_reset_tokens` (Feature A — Password Reset; planned — BE-19, migration `0004` not yet implemented)
 Single-use hashed tokens sent via Resend to reset a forgotten password. Same hash-at-rest discipline as `email_verification_tokens`: the plaintext token lives only in the email link, the database stores only the SHA-256 hex digest of a 256-bit URL-safe random value.
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -229,7 +229,7 @@ Single-use hashed tokens sent via Resend to reset a forgotten password. Same has
 | `expires_at` | `TIMESTAMPTZ` | NO | — | Expiration timestamp (`PASSWORD_RESET_TOKEN_TTL_MINUTES`, default 60 minutes); expired tokens return `400 RESET_TOKEN_EXPIRED` |
 | `used_at` | `TIMESTAMPTZ` | YES | NULL | Set when the token is consumed; a used token cannot be replayed |
 | `created_at` | `TIMESTAMPTZ` | NO | `CURRENT_TIMESTAMP` | Token issuance timestamp |
-*(Unique `token_hash`; indexes on `(user_id)` and `(token_hash)`. Successful reset consumes the token, updates the password and revokes every `auth_sessions` row of the user with reason `security` — see `.docs/technical/auth-flow.md` §2.5 and §2.8.)*
+*(Unique `token_hash`; indexes on `(user_id)` and `(token_hash)`. Successful reset consumes the token, updates the password and revokes every `auth_sessions` row of the user with reason `security` — see `.docs/technical/auth-flow.md` §2.5 and §2.8. As with `email_verification_tokens`, no automated token-purge maintenance job exists in the code yet — only manual CLI cleanup (ADR-020 cleanup job deferred).)*
 
 ### 2.15 `usage_daily` (AI Usage Tracking — BE-20)
 Daily per-user/provider/model aggregate counters, upsert-incremented after each completed AI generation. Pure metadata: no message IDs, prompts or response content are recorded, so Privacy Mode remains fully compatible.
@@ -271,7 +271,7 @@ Synchronized creates/updates, soft deletes, message appends and history clearanc
 | `idx_user_api_keys_active` | `user_api_keys` | `(user_id, provider, is_active)` | Sub-millisecond active BYOK key lookup during AI stream dispatch |
 | `idx_reading_history_user_visited`| `reading_history` | `(user_id, visited_at DESC)` | History pagination and recent reading lookups |
 | `idx_quiz_records_user_created` | `quiz_records` | `(user_id, created_at DESC)` | Quiz history pagination and UTC date-range filtering (`GET /quiz`, `GET /quiz/stats`) |
-| `idx_quiz_records_user_score` | `quiz_records` | `(user_id, score)` | Submitted-quiz aggregates for `GET /quiz/stats` (attempts/avg-score per day and overall) |
+| `idx_quiz_records_user_score` | `quiz_records` | `(user_id, score)` | Submitted-quiz aggregates for `GET /quiz/stats` (attempts/avg-score per day and overall) (planned — BE-22; migration `0006` not yet implemented) |
 | `idx_auth_sessions_user` | `auth_sessions` | `(user_id, revoked_at)` | Session validation and account-wide revocation |
 | `idx_refresh_tokens_session` | `refresh_tokens` | `(session_id)` | Chain revocation and cleanup |
 | `idx_conversations_sync` | `conversations` | `(user_id, updated_at, id)` | Unified sync including tombstones |

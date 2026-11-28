@@ -11,6 +11,7 @@ The API is packaged using the repository root `Dockerfile`; environment configur
    docker build -t readhead-be:<version> .
    ```
 2. Supply configuration at runtime via environment variables (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET_KEY`, `ENCRYPTION_MASTER_KEYS`, `CURRENT_KEY_VERSION`, `RESEND_API_KEY`, `MAIL_FROM_ADDRESS`, `APP_BASE_URL`, ports — full registry in `.docs/technical/environment-variables.md`). Do not copy a `.env` file into the image; the local `.env` is git-ignored development material.
+   - **Note (planned — BE-19)**: the email variables (`RESEND_API_KEY`, `MAIL_FROM_ADDRESS`, `APP_BASE_URL`, `VERIFICATION_TOKEN_TTL_HOURS`, `PASSWORD_RESET_TOKEN_TTL_MINUTES`, `VERIFICATION_RESEND_LIMIT_PER_HOUR`) are **not yet read by `config.py`** (`extra="ignore"`), so supplying them today is harmless but has no effect until BE-19 is implemented.
 3. Run migrations as a separate, one-off step against the target database before (or while) the new version serves traffic:
    ```bash
    alembic upgrade head
@@ -29,7 +30,7 @@ The API is packaged using the repository root `Dockerfile`; environment configur
 
 - All secrets live in environment variables provided by the deployment platform's secret store (or an equivalent runtime `--env-file` with restrictive permissions). **No secret is ever committed** to the repository; the committed `.env.example` contains placeholders only.
 - `ENCRYPTION_MASTER_KEYS` is the highest-value secret: it decrypts every stored BYOK key. Distribute it only to API workers and maintenance processes, rotate exclusively via the Zero-Downtime Rotation Runbook in `commands.md`, and pair every backup with the key versions it needs (Backup & Restore Runbook, `commands.md`).
-- Database/Redis credentials, the JWT secret and `RESEND_API_KEY` follow the same rule: injected at runtime, never logged (`FR-OPS-03`), never echoed in error responses or issue reports.
+- Database/Redis credentials, the JWT secret and `RESEND_API_KEY` follow the same rule: injected at runtime, never logged (`FR-OPS-03`), never echoed in error responses or issue reports. (`RESEND_API_KEY` is planned — BE-19; see §1 for the not-yet-implemented email variables.)
 - If a secret is suspected to be leaked, rotate it (keys via the rotation runbook; DB/Redis credentials via the provider) and revoke user sessions where the exposure implies account access.
 
 ## 3. Rollback Deployment

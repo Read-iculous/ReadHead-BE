@@ -37,5 +37,5 @@
 | **HTTP Testing** | `httpx` (AsyncClient) | Testing API endpoints asynchronously |
 | **Code Formatter** | `black` | Line length 88 |
 | **Import Sorter** | `isort` | Standard multi-line formatting |
-| **Linting** | `flake8` / `ruff` | PEP8 & bug detection |
+| **Linting** | `ruff` | PEP8 & bug detection |
 | **Type Checking** | `mypy` | Strict type validation |

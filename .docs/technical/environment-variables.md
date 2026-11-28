@@ -6,7 +6,7 @@ All environment variables are loaded and validated at startup using Pydantic Set
 | Variable Name | Required | Default Value | Description |
 |---|---|---|---|
 | `ENVIRONMENT` | No | `development` | Environment mode (`development`, `staging`, `production`) |
-| `DEBUG` | No | `true` | Enables verbose logging and exception stack traces |
+| `DEBUG` | No | `false` | Enables verbose logging and exception stack traces |
 | `PORT` | No | `8000` | Port for the Uvicorn server |
 | `DATABASE_URL` | **Yes** | — | Async PostgreSQL connection string: `postgresql+asyncpg://user:pass@localhost:5432/readhead` |
 | `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection URL for rate limiting, token blacklist & cache |
@@ -22,18 +22,24 @@ All environment variables are loaded and validated at startup using Pydantic Set
 | `GITHUB_CLIENT_ID` | Conditional | `""` | GitHub OAuth2 Client ID |
 | `GITHUB_CLIENT_SECRET` | Conditional | `""` | GitHub OAuth2 Client Secret |
 | `CORS_ORIGINS` | No | `chrome-extension://*` | Comma-separated list of allowed origins (e.g., extension IDs, dev tools) |
-| `RESEND_API_KEY` | Conditional | `""` | Resend API key for transactional email delivery (email verification, password reset). **Required when email verification is enabled**; with an empty key, registration still succeeds but `verification_email_sent` is `false` and verification cannot complete |
-| `MAIL_FROM_ADDRESS` | Conditional | `""` | Verified sender address for all Resend email (e.g. `no-reply@readhead.io`); must belong to a domain with SPF/DKIM/DMARC configured (see runbook in `.docs/development/commands.md`) |
-| `APP_BASE_URL` | Conditional | `""` | Public backend base URL used to build verification and password-reset links inside emails (e.g. `https://api.readhead.io`) |
-| `VERIFICATION_TOKEN_TTL_HOURS` | No | `24` | Lifetime of email verification tokens; expired tokens return `400 VERIFICATION_TOKEN_EXPIRED` |
-| `PASSWORD_RESET_TOKEN_TTL_MINUTES` | No | `60` | Lifetime of password reset tokens; expired tokens return `400 RESET_TOKEN_EXPIRED` |
-| `VERIFICATION_RESEND_LIMIT_PER_HOUR` | No | `3` | Maximum verification email resends per email address per hour (per-email limit; the shared `AUTH_REQUESTS_PER_MINUTE` auth bucket still applies) |
-
 | `POSTGRES_PORT` | No | `5432` | Docker Compose host port; match the port in `DATABASE_URL` |
 | `REDIS_PORT` | No | `6379` | Docker Compose host port; match the port in `REDIS_URL` |
 | `AUTH_REQUESTS_PER_MINUTE` | No | `20` | Per-client auth fixed-window limit |
 | `AI_REQUESTS_PER_MINUTE` | No | `30` | Per-identity AI/quiz initial request limit |
 | `API_REQUESTS_PER_MINUTE` | No | `120` | Per-identity general API fixed-window limit |
+
+### Planned — BE-19 (not yet in config.py)
+
+| Variable Name | Required | Default Value | Description |
+|---|---|---|---|
+| `RESEND_API_KEY` | Conditional | `""` | Resend API key for transactional email delivery (email verification, password reset). **Required when email verification is enabled**; with an empty key, registration still succeeds but `verification_email_sent` is `false` and verification cannot complete |
+| `MAIL_FROM_ADDRESS` | Conditional | `""` | Verified sender address for all Resend email (e.g. `no-reply@readhead.io`); must belong to a domain with SPF/DKIM/DMARC configured (see runbook in `.docs/development/commands.md`) |
+| `APP_BASE_URL` | Conditional | `""` | Public backend base URL used to build verification and password-reset links inside emails (e.g. `https://api.readhead.io`) |
+| `VERIFICATION_TOKEN_TTL_HOURS` | No | `24` | Lifetime of email verification tokens; expired tokens return `400 VERIFICATION_TOKEN_EXPIRED` |
+| `PASSWORD_RESET_TOKEN_TTL_MINUTES` | No | `30` | Lifetime of password reset tokens; expired tokens return `400 RESET_TOKEN_EXPIRED`. Default **30 minutes per ADR-021** (supersedes the previous 60-minute value in ADR-015) |
+| `VERIFICATION_RESEND_LIMIT_PER_HOUR` | No | `3` | Maximum verification email resends per email address per hour (per-email limit; the shared `AUTH_REQUESTS_PER_MINUTE` auth bucket still applies) |
+
+> **Note**: These variables are planned — BE-19 and are **not yet defined in `app/core/config.py`**. Because `config.py` uses `extra="ignore"` in its `SettingsConfigDict`, they are **silently ignored** if supplied today; they only take effect once BE-19 is implemented.
 
 ### Keyring Startup Validation and Rotation
 - A non-empty `ENCRYPTION_MASTER_KEYS` takes precedence; otherwise map `ENCRYPTION_MASTER_KEY` to `CURRENT_KEY_VERSION` as the single-key development fallback.
@@ -41,6 +47,7 @@ All environment variables are loaded and validated at startup using Pydantic Set
 - Follow `.docs/development/commands.md` for writer-first rotation. Every process must load both versions before any writer switches; remove an old live key only after all writers and records have migrated.
 
 ### Resend Email Delivery Notes
+- These variables are planned — BE-19; `config.py` does not read them yet (see the planned table in §1), so supplying them today has no effect.
 - `RESEND_API_KEY` and `MAIL_FROM_ADDRESS` must both be set for verification/reset emails to send. Emails are delivered through Resend's HTTPS API; no SMTP connection is used.
 - **`@resend.dev` sender limitation**: The shared test sender `noreply@resend.dev` can only deliver to the email address of the Resend account that owns the API key — it cannot reach arbitrary users. It is suitable for local development/self-testing only; **production must verify a dedicated sending domain** (SPF, DKIM and DMARC) and switch `MAIL_FROM_ADDRESS` to an address on it.
 - Before sending from production, configure the sending domain in Resend and publish **SPF, DKIM and DMARC** DNS records for it (see the runbook in `.docs/development/commands.md`). Unverified domains cause bounces/spam classification.
@@ -103,6 +110,7 @@ RESEND_API_KEY=
 MAIL_FROM_ADDRESS=noreply@resend.dev
 APP_BASE_URL=http://localhost:8000
 VERIFICATION_TOKEN_TTL_HOURS=24
-PASSWORD_RESET_TOKEN_TTL_MINUTES=60
+# 30 minutes per ADR-021 (supersedes ADR-015's 60-minute value)
+PASSWORD_RESET_TOKEN_TTL_MINUTES=30
 VERIFICATION_RESEND_LIMIT_PER_HOUR=3
 ```

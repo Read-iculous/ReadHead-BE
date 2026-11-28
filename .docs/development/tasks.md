@@ -166,6 +166,8 @@ Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
   - Auto-links to existing account if email matches and provider confirms email verification.
   - Returns `200 OK` with standard `TokenResponse`.
   - Handled network errors or rejected provider tokens return `401 TOKEN_INVALID`.
+  - OAuth sign-in where the provider indicates the email is not verified returns `403 EMAIL_NOT_VERIFIED`.
+  - OAuth flow that cannot produce a verified email address returns `400 OAUTH_EMAIL_MISSING`.
 - **Verification / Screenshot**:
   - Test: Mocked unit tests verifying token exchange logic.
   - Screenshot: Swagger UI response for `/api/v1/auth/oauth/google` returning access and refresh tokens.
@@ -202,7 +204,7 @@ Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
 - **Acceptance Criteria**:
   - Newly created users automatically receive default settings (`default_provider: "gemini"`, `proactive_assistance_enabled: true`, `data_protection_mode: true`).
   - `PATCH /api/v1/users/me/settings` updates specified fields and increments the `version` integer for sync.
-  - Invalid settings (e.g. unsupported provider, invalid language code) return `422 VALIDATION_ERROR`.
+  - Invalid settings return domain-specific codes: unsupported `default_provider` returns `400 UNSUPPORTED_PROVIDER` (ISSUE-032), not the generic `422 VALIDATION_ERROR`; unsupported language values will return `400 UNSUPPORTED_LANGUAGE` once added by BE-21.
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_concurrency_privacy_review.py -k "settings or provider or privacy" -v` (no dedicated `test_settings_api.py` exists).
   - Note: unsupported `default_provider` returns `400 UNSUPPORTED_PROVIDER` per `.docs/api/endpoints.md`, not the generic `422 VALIDATION_ERROR`.
@@ -346,7 +348,7 @@ Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
 - **Feature Reference**: Feature D (`FR-CNT-05~07`), Feature I (`FR-HIS-01~10`), `ADR-012`
 - **Description**: Manage reading conversation threads, guaranteeing strict tab isolation via `reading_session_id`, chronological message retrieval, source grounding flags, and soft deletion with tombstone persistence.
 - **Plan & Codebase**:
-  - `app/schemas/conversation.py`: `ConversationResponse`, `MessageResponse` (with `is_grounded`, `uncertainty_flag`).
+  - `app/schemas/responses.py`: `ConversationResponse`, `MessageResponse` (with `is_grounded`, `uncertainty_flag`).
   - `app/services/conversation_service.py`: Create sessions, bind `reading_session_id`, append messages (in an atomic transaction that bumps `conversations.updated_at = :sync_timestamp` and `conversations.version = version + 1`), list conversations with search, and soft delete conversations (`is_deleted = TRUE`).
   - `app/routers/conversations.py`: `GET /conversations`, `GET /conversations/{id}/messages` (returns 404 if conversation is soft-deleted), `DELETE /conversations/{id}`.
 - **Acceptance Criteria**:
@@ -384,12 +386,13 @@ Phase 14: Admin Audit Trail & Portal Hardening (Platform Ops extension)
 - **Description**: Allow users to rate AI responses (helpful / unhelpful) and report inaccuracies or hallucinations to track AI answer quality. Enforce message ownership and duplicate UPSERT.
 - **Plan & Codebase**:
   - `app/schemas/feedback.py`: `AiFeedbackCreateRequest` (`message_id`, `rating`, `report_reason`, `comment`).
-  - `app/services/feedback_service.py`: Record or atomically update feedback linked to user and message. Verify message belongs to user's conversation (`403 FORBIDDEN_RESOURCE` if not).
+  - `app/services/feedback_service.py`: Record or atomically update feedback linked to user and message. Verify message belongs to user's conversation (`404 MESSAGE_NOT_FOUND` if it does not exist or belongs to another user — anti-enumeration, consistent with quiz §6.2/§6.5 and conversations §7.3).
   - `app/routers/ai.py`: Mount `POST /api/v1/ai/feedback`.
 - **Acceptance Criteria**:
   - Authenticated user can submit feedback for an existing message.
   - Duplicate feedback updates the existing rating.
   - Submitting feedback on a non-existent message returns `404 MESSAGE_NOT_FOUND`.
+  - `POST /ai/feedback` with a `message_id` belonging to another user returns `404 MESSAGE_NOT_FOUND` (not `403` — anti-enumeration).
 - **Verification / Screenshot**:
   - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_text_email_domain_errors.py -v` (no dedicated `test_feedback_api.py`)
   - Screenshot: Swagger UI response for `POST /api/v1/ai/feedback` returning `201 Created`.

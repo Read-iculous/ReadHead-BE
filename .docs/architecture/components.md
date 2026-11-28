@@ -39,7 +39,7 @@ app/
 │   ├── user.py                # User profile schemas
 │   ├── api_key.py             # Key creation (plaintext in) & display (masked out)
 │   ├── ai.py                  # Prompt requests, task options, streaming chunks, grounding
-│   ├── conversation.py        # Sessions and messages schemas
+│   ├── responses.py           # Shared public response schemas (conversations, messages, users)
 │   ├── reading.py             # History, highlights, stats schemas
 │   ├── quiz.py                # Quiz questions, answer submission, score schemas
 │   ├── sync.py                # Multi-device sync push/pull & conflict schemas (Feature J)
@@ -126,6 +126,14 @@ app/
   1. **Pre-Stream Read**: Transient DB transaction validates user/auth session, loads the BYOK key, verifies tab ownership/privacy policy, and creates the conversation/user message in standard mode. Commit and release before streaming; skip writes in Privacy Mode.
   2. **Zero-DB Streaming Loop**: Token yielding, prompt fencing, citation analysis, and Redis cancellation checks (`revoked_users:{user_id}`, `revoked_sessions:{sid}`) run without holding any open database connection.
   3. **Post-Stream Write**: A brief scoped DB transaction commits the assistant message/version and allocated sync timestamp before `done`; on failure emit `PERSISTENCE_FAILED` and offer UI copying only. Disconnect saves partial output in standard mode; writes are skipped in Privacy Mode.
+
+### 2.7a Stream Lease & SSE Concurrency Guard (`app/core/redis.py`)
+- `StreamLease` (defined in `app/core/redis.py`) enforces the SSE admission/concurrency policy used by `/ai/stream` (§5.2) and the conversation-busy guard, atomically via a Redis Lua script:
+  1. **User ZSET**: active streams are members of the ZSET `active_streams:{user_id}` (one member per stream lease, score = lease deadline). Admission is capped at **2 concurrent streams per user** (`zcard >= 2` → `429 STREAM_CONCURRENCY_EXCEEDED`).
+  2. **Per-conversation guard**: a companion key `conversation_stream:{user_id}:{conversation_id}` (30s TTL) reserves the conversation; if it already exists, admission returns `409 CONVERSATION_BUSY`.
+  3. **Heartbeat & expiry**: a background heartbeat task renews the guard key and the member score every 8s with a 30s lease (member score = `now + 30`); the whole ZSET key carries a 35s expire. On Redis outage the lease degrades gracefully (stream proceeds without slot accounting).
+  4. **Release**: closing the stream removes the lease's own member and guard key (owner-checked, idempotent).
+- **Diagnostic**: if a stream slot appears not to be released, inspect the heartbeat/TTL of this ZSET first — e.g. `ZRANGE active_streams:{user_id} 0 -1 WITHSCORES` (members whose score is in the past are stale and are purged automatically on the next admission) and `TTL active_streams:{user_id}` (should be ≤ 35s and refreshed by live streams).
 
 ### 2.8 Structured JSON Logging & Telemetry Redaction (`app/core/logging.py`)
 - Enforces cloud-native observability and strict privacy compliance (`FR-OPS-03`):
