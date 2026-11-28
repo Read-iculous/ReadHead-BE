@@ -334,7 +334,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Historical messages include `is_grounded` and `uncertainty_flag` metadata.
   - `DELETE /conversations/{id}` performs soft delete (`is_deleted = TRUE`), generating a sync tombstone retained for 30 days. Child messages are hidden from GET queries.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_conversations_api.py -v`
+  - Test: `pytest tests/integration/test_stream_review.py tests/integration/test_concurrency_privacy_review.py tests/integration/test_review_regressions.py -v` (no dedicated `test_conversations_api.py`; tab binding, soft delete and tombstone coverage live there)
   - Screenshot: Swagger UI response for `/api/v1/conversations/{id}/messages` showing message history with grounding metadata.
 
 ---
@@ -353,7 +353,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `DELETE /api/v1/reading/highlights/{id}` soft-deletes a highlight (`is_deleted = TRUE`, `version = version + 1`, `updated_at = :sync_timestamp`), returns `204 No Content`, and preserves a sync tombstone for cross-device synchronization (`FR-HIS-06`).
   - `DELETE /api/v1/reading/history` clears browsing logs and atomically sets `conversations.page_url = NULL, conversations.page_title = NULL` to eliminate past browsing ghost footprints under GDPR (`FR-HIS-05`, `FR-HIS-07`).
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_reading_history_api.py -v`
+  - Test: `pytest tests/integration/test_concurrency_privacy_review.py tests/integration/test_text_email_domain_errors.py tests/integration/test_send_disconnect_domain_password.py -v` (no dedicated `test_reading_history_api.py`)
   - Screenshot: Response of `DELETE /api/v1/reading/history` returning `204 No Content` and verifying database rows wiped.
 
 ---
@@ -370,7 +370,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Duplicate feedback updates the existing rating.
   - Submitting feedback on a non-existent message returns `404 MESSAGE_NOT_FOUND`.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_feedback_api.py -v`
+  - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_text_email_domain_errors.py -v` (no dedicated `test_feedback_api.py`)
   - Screenshot: Swagger UI response for `POST /api/v1/ai/feedback` returning `201 Created`.
 
 ---
@@ -392,7 +392,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - In a conflict situation (stale version submitted), server returns `409 SYNC_CONFLICT` with both versions, strictly preventing silent data loss (`FR-SYN-05`).
   - In-flight unsent drafts are excluded from synchronization (`FR-SYN-07`).
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_sync_engine.py -v`
+  - Test: `pytest tests/integration/test_concurrency_privacy_review.py tests/integration/test_text_email_domain_errors.py tests/unit/test_review_regressions.py -v` (no dedicated `test_sync_engine.py`; pull cursor + push conflict coverage live there)
   - Screenshot: Postman response showing `409 Conflict` payload containing conflicting server and client entities.
 
 ---
@@ -411,7 +411,8 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - All tests pass via `pytest --cov=app`.
   - Linter (`black --check app/`, `ruff check app/`, `mypy app/`) passes with zero errors.
 - **Verification / Screenshot**:
-  - Command: `pytest -v --cov=app --cov-report=term-missing`
+  - Command: `pytest -v --cov=app --cov-report=term-missing` with full-integration env (`READHEAD_FULL_INTEGRATION=1` + PostgreSQL/Redis URLs)
+  - Note: named files `tests/integration/test_user_journey.py` and `tests/integration/test_security_rules.py` do not exist; journey coverage is distributed across the integration suite and vault security lives in `tests/unit/test_security_vault.py`
   - Screenshot: Terminal output showing 100% passed test suite and code coverage summary table.
 
 ---

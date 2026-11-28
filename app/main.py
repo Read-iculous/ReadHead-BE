@@ -166,7 +166,9 @@ async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
                 else (
                     "NOT_FOUND"
                     if exc.status_code == 404
-                    else "UNAUTHORIZED" if exc.status_code == 401 else "VALIDATION_ERROR"
+                    else (
+                        "UNAUTHORIZED" if exc.status_code == 401 else "VALIDATION_ERROR"
+                    )
                 )
             ),
             field=None,

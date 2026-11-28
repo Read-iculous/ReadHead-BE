@@ -24,7 +24,8 @@ async def rotate(old: str, new: str) -> None:
         or cfg.current_key_version != new
     ):
         raise ValueError("Load both keys and switch all writers to --new-version first")
-    count, skipped = 0, []
+    count = 0
+    skipped: list[str] = []
     try:
         while True:
             async with transaction() as db:
