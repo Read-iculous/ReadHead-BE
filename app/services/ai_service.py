@@ -71,7 +71,9 @@ async def prepare(principal: Principal, data: AiStreamRequest) -> PreparedStream
                 *[t["content"] for t in history],
             ]
         )
-        enforce(settings, data.page_url, outbound, data.bypass_protection)
+        # Pre-check before key load: no audit log here; the final re-check
+        # (after history reload) is the authoritative single audit point.
+        enforce(settings, data.page_url, outbound, data.bypass_protection, audit=False)
         if data.task in {"summarize", "simplify", "translate"} and not (
             data.page_content.strip() or data.selected_text.strip()
         ):

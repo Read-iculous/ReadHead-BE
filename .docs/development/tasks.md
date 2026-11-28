@@ -234,7 +234,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - Unit tests with mock responses verify that each adapter properly handles rate limits, token timeouts, and authentication errors.
   - Grounding prompts instruct models to explicitly declare when answers rely on external training data vs current page text.
 - **Verification / Screenshot**:
-  - Test: `pytest tests/unit/test_ai_adapters.py -v`
+  - Test: `pytest tests/unit/test_sse_cleanup.py tests/unit/test_ai_edge_paths.py -v`
   - Output: Test log showing mocked streaming chunks successfully yielded from all three adapters.
 
 ---
@@ -257,7 +257,8 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - On `PERSISTENCE_FAILED`, retain text in current UI memory as "Not saved" and allow copying. MVP provides no retry-save operation or automatic LLM replay.
   - Supports `content_type: "pdf_text"` with client-extracted plain text (max 100KB); rejects raw binary files.
 - **Verification / Screenshot**:
-  - Command: `curl -N -X POST http://localhost:8000/api/v1/ai/stream -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"task": "explain", "selected_text": "Photosynthesis"}'`
+  - Command: `curl -N -X POST http://localhost:8000/api/v1/ai/stream -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"task": "explain", "page_url": "https://example.com/a", "selected_text": "Photosynthesis converts light into chemical energy."}'`
+  - Test: `pytest tests/integration/test_stream_review.py tests/integration/test_send_disconnect_domain_password.py tests/integration/test_admin_marker_empty_completion.py tests/unit/test_ai_edge_paths.py tests/unit/test_sse_cleanup.py -v`
   - Screenshot: Terminal or Postman showing continuous event stream output chunk by chunk.
 
 ---
@@ -295,7 +296,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - On complex technical or academic text with high dwell time, returns `has_suggestion: true` with a short plain-text hint and suggested action.
   - Does not execute actions autonomously without user confirmation (`FR-PRV-03`).
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_proactive_api.py -v`
+  - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_stream_review.py tests/integration/test_concurrency_privacy_review.py -v` (proactive-suggest coverage)
   - Screenshot: Postman response for `/api/v1/ai/proactive-suggest` returning a suggestion payload.
 
 ---
@@ -313,7 +314,7 @@ Phase 10: Admin Management, Telemetry & Rate Limiting (Platform Ops)
   - `POST /quiz/{id}/submit` compares submitted answers against stored keys, returns score (e.g. 4/5) and explanations.
   - Re-submitting an already graded quiz returns `400 QUIZ_ALREADY_SUBMITTED` (`BR-07`).
 - **Verification / Screenshot**:
-  - Test: `pytest tests/integration/test_quiz_api.py -v`
+  - Test: `pytest tests/integration/test_ai_quiz_oauth_admin.py -v` (quiz generate/submit/privacy coverage; `tests/integration/test_quiz_api.py` does not exist)
   - Screenshot: Swagger UI execution of `/api/v1/quiz/generate` showing generated quiz questions.
 
 ---
