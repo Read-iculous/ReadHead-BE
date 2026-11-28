@@ -13,3 +13,6 @@
 | **Reading History** | A chronological record of articles read via the browser extension, including dwell time and cached summaries. |
 | **Highlight** | A specific text snippet selected and saved by the user on a web page, optionally associated with personal notes and color categories. |
 | **Provider Adapter** | An internal abstraction class implementing a uniform interface (`BaseAIProvider`) to communicate with specific AI vendors (OpenAI, Gemini, Anthropic). |
+
+| **Auth Session (`sid`)** | One login/OAuth session and its refresh-token chain, backed by `auth_sessions`; distinct from a tab reading session. |
+| **Sync Checkpoint** | Completed server-issued cursor boundary across all synchronized entities; full resync replaces only the synced cache and preserves unsent work. |

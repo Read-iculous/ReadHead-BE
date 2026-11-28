@@ -5,6 +5,8 @@
 ```mermaid
 erDiagram
     users ||--o{ oauth_accounts : "has"
+    users ||--o{ auth_sessions : "opens"
+    auth_sessions ||--o{ refresh_tokens : "rotates"
     users ||--o{ refresh_tokens : "owns"
     users ||--o{ user_api_keys : "manages"
     users ||--|| user_settings : "configures"
@@ -25,6 +27,7 @@ erDiagram
         string role
         string status
         boolean is_active
+        datetime sync_clock
         datetime created_at
     }
 
@@ -35,10 +38,22 @@ erDiagram
         string provider_user_id
     }
 
+    auth_sessions {
+        uuid id PK
+        uuid user_id FK
+        datetime expires_at
+        datetime revoked_at
+        string revocation_reason
+    }
+
     refresh_tokens {
         uuid id PK
         uuid user_id FK
+        uuid session_id FK
+        uuid replaced_by_token_id FK
         string token_hash
+        datetime revoked_at
+        string revocation_reason
         boolean is_revoked
         datetime expires_at
     }
@@ -99,7 +114,6 @@ erDiagram
         string page_title
         text cached_summary
         integer reading_time_seconds
-        boolean is_bookmarked
         datetime visited_at
     }
 
@@ -139,15 +153,18 @@ erDiagram
 ```
 
 ## 2. Foreign Key & Cascade Policies
-- **User Cascade**: When a `user` is deleted, all dependent records (`oauth_accounts`, `refresh_tokens`, `user_api_keys`, `user_settings`, `conversations`, `reading_history`, `highlights`, `quiz_records`, `ai_feedback`) are **CASCADED** (`ON DELETE CASCADE`).
+- **User Cascade**: When a `user` is deleted, all dependent records (`oauth_accounts`, `auth_sessions`, `refresh_tokens`, `user_api_keys`, `user_settings`, `conversations`, `reading_history`, `highlights`, `quiz_records`, `ai_feedback`) are **CASCADED** (`ON DELETE CASCADE`).
+- **Session Cascade**: Physical deletion of an `auth_sessions` row cascades its refresh-token chain. Logout normally revokes the row instead of deleting it. Token `[session_id, user_id]` must reference the matching session owner.
 - **Conversation Cascade**: When a `conversation` is deleted, child `messages` are **CASCADED** (`ON DELETE CASCADE`).
 - **Message Cascade**: When a `message` is deleted, its `ai_feedback` is **CASCADED**.
 - **Index Recommendations**:
   - `users(email)`: Unique index.
   - `user_api_keys(user_id, provider)`: Unique index.
   - `reading_history(user_id, visited_at DESC)`: B-tree index for efficient pagination.
-  - `highlights(user_id, page_url)`: B-tree index for page-level highlight retrieval.
+  - `highlights(user_id, md5(page_url))`: B-tree expression index for page-level highlight retrieval with bounded entries. Queries also compare the full URL; ownership and cascade relationships are unchanged.
   - `conversations(user_id, updated_at DESC)`: Index for recent conversation lookups.
   - `messages(conversation_id, created_at ASC)`: Chronological retrieval.
   - `quiz_records(user_id, created_at DESC)`: Historical quiz reviews.
   - `ai_feedback(user_id, message_id)`: Unique index enforcing one active rating per user per message.
+
+- Session validation/chain indexes and tombstone-inclusive sync indexes: see `.docs/database/schema.md` §3.

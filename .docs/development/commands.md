@@ -47,8 +47,8 @@ pytest tests/unit/
 # Run integration tests only
 pytest tests/integration/
 
-# Run a single test file
-pytest tests/integration/test_auth_api.py -v
+# Run the auth-focused integration files (there is no test_auth_api.py)
+pytest tests/integration/test_ai_quiz_oauth_admin.py tests/integration/test_account_cache_url_refresh_errors.py tests/integration/test_concurrency_privacy_review.py tests/integration/test_send_disconnect_domain_password.py -v
 ```
 
 ## 4. Code Quality, Formatting & Linting
@@ -99,3 +99,83 @@ docker compose down
 # Stop services and remove volumes (clean reset)
 docker compose down -v
 ```
+
+### Zero-Downtime Rotation Runbook
+1. Distribute `ENCRYPTION_MASTER_KEYS` containing both `v1` and `v2` to every API worker and maintenance process. Keep `CURRENT_KEY_VERSION=v1` until every process can decrypt both versions.
+2. Roll out `CURRENT_KEY_VERSION=v2` to **all writers** and confirm no old-version writer remains. Keep both keys available; existing `v1` records remain readable.
+3. Run `python -m app.cli.rotate_keys --old-version v1 --new-version v2`. Process bounded batches. Each update uses a compare-and-swap on record ID and the exact original ciphertext (`WHERE id = :id AND encrypted_key = :original_ciphertext`), so a concurrent user key replacement is never overwritten. Skip/re-read changed rows; resume safely after interruption. Cipher-only re-encryption does not change user-visible metadata.
+4. Verify every active writer still uses `v2`, no database row has a `v1:` prefix, and a second scan finds zero remaining `v1` rows. Only then remove `v1` from live keyrings. Retain old key material securely for the backup-restore retention policy; restoring an old backup requires its matching key.
+5. On migration failure keep the dual keyring and continue serving reads/writes with `v2`; resume migration. Never remove a key still referenced by a record. Rolling back a writer to `v1` invalidates the completion check and requires another migration scan.
+
+### Backup & Restore Runbook
+
+> **Scope note**: This runbook documents the backup/restore *procedure* only. RTO/RPO targets (FR-OPS-05, SYS-QLT-RAM-005) are **placeholders — not yet approved by operations**; do not quote any number below as a service commitment until they are signed off.
+
+**Backup (PostgreSQL via `pg_dump`)**
+1. Dump the whole database in custom format (compressed, restorable with selective parallelism):
+   ```bash
+   pg_dump --format=custom --file "readhead_$(date -u +%Y%m%dT%H%M%SZ).dump" "$DATABASE_URL"
+   ```
+2. Recommended schedule until an approved policy exists (placeholder, subject to FR-OPS-05 sign-off):
+   - **Daily** full dump, kept 7 days.
+   - **Weekly** full dump, kept 4–8 weeks.
+   - Retention beyond that requires an approved policy; do not accumulate unbounded dumps.
+3. **Every backup MUST be paired with the `ENCRYPTION_MASTER_KEYS` keyring version(s) active at dump time.** User API keys are AES-256-GCM encrypted with versioned master keys: restoring an old backup against a keyring that lacks the matching version yields `500 ENCRYPTION_ERROR` for every affected user. Store the key version mapping alongside each dump (e.g. `readhead_20261129T020000Z.dump.keys-v1v2.txt`), encrypted or in the same secret store as the keys — never in plaintext next to the dump. This pairing is the same constraint enforced by the Zero-Downtime Rotation Runbook above: keep retired key material until it is no longer referenced by *any* backup within the retention window.
+4. **Redis is NOT backed up.** Redis holds only revocation tombstones, rate-limit buckets, stream leases and TTL caches. After a restore, tombstones are **recreated by a full resync of the client** (ADR-013 full-resync semantics rebuild the client cache from PostgreSQL), and rate/lease state simply expires. Never restore a stale Redis snapshot under a fresh database — it can resurrect tombstone state for users that no longer match.
+
+**Offsite storage (recommendation)**: copy dumps and the key-version mapping to an offsite location (object storage or a separate host) with access control distinct from the database host, and verify the transfer succeeded (checksum) — a backup that only lives on the database host does not survive host loss. Encryption at rest for the offsite copy is recommended; this is a recommendation, not an approved policy.
+
+**Restore procedure**
+1. Stop writers (or deploy the maintenance banner) so the restored database is not forked against newer writes; note the exact dump timestamp — everything after it is lost.
+2. Provision the target PostgreSQL 15 instance and confirm the matching `ENCRYPTION_MASTER_KEYS` keyring (including the key versions recorded for the dump) is distributed to all API workers **before** they start.
+3. Restore:
+   ```bash
+   pg_restore --clean --if-exists --dbname "$DATABASE_URL" "readhead_<timestamp>.dump"
+   ```
+4. Align Alembic: `alembic current` on the restored database must equal the revision that was head at the dump time; if an older revision is found, apply `alembic upgrade head` (later migrations are already baked into newer dumps).
+5. Start the API workers and verify health: `GET /api/v1/health` returns `status: "healthy"` (§1.1) and `GET /api/v1/health/live` returns the live probe (§1.2).
+6. Spot-check a user with a stored BYOK key: a key listing or validation ping must succeed (proves the master-key pairing); failures here mean the wrong keyring was supplied — stop and fix keys before serving traffic.
+7. Clients detect the data rollback via sync versions and perform a **full resync** (ADR-013), which also re-establishes the Redis-side state that was deliberately not backed up.
+
+**Restore drill**: rehearse the full procedure on a disposable instance at least quarterly (placeholder cadence until FR-OPS-05/RPO-RTO targets are approved) — restore the newest dump against throwaway PostgreSQL/Redis, run steps 3–7, and record the elapsed time as draft RTO evidence. A backup that has never been restored is not a backup.
+
+### Resend Email Runbook (BE-19)
+
+**Domain setup (SPF / DKIM / DMARC)**
+1. Register a Resend account, add the sending domain (e.g. `readhead.io`) under Domains, and publish the DNS records Resend displays:
+   - **SPF**: `v=spf1 include:amazonses.com ~all` (Resend sends via Amazon SES) as a TXT record on the apex.
+   - **DKIM**: the three `resend._domainkey` CNAME records shown by Resend (selectors differ per domain).
+   - **DMARC**: TXT `_dmarc.readhead.io` starting at `v=DMARC1; p=none; rua=mailto:dmarc@readhead.io`, tightening to `p=quarantine`/`p=reject` once reports look clean.
+2. Wait for the domain to show **Verified** in Resend before sending from production (`MAIL_FROM_ADDRESS` must use that domain; e.g. `no-reply@readhead.io`).
+3. Set `RESEND_API_KEY`, `MAIL_FROM_ADDRESS` and `APP_BASE_URL` in `.env` (see `.docs/technical/environment-variables.md`).
+
+**Testing email locally**
+```bash
+# 1. Register a local test account (uses APP_BASE_URL for link building)
+curl -i -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "test@example.com", "password": "SecurePassword123!", "full_name": "Test User"}'
+
+# 2. Login must be blocked before verification
+curl -i -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "test@example.com", "password": "SecurePassword123!"}'
+# -> 403 EMAIL_NOT_VERIFIED
+
+# 3. Resend the verification email (rate limit: 3/hour per address)
+curl -i -X POST http://localhost:8000/api/v1/auth/verify-email/resend \
+  -H "Content-Type: application/json" -d '{"email": "test@example.com"}'
+
+# 4. Read the token from the Resend dashboard/test inbox (or the local catcher below),
+#    then verify and log in
+curl -i -X POST http://localhost:8000/api/v1/auth/verify-email -H "Content-Type: application/json" -d '{"token": "<token_from_email>"}'
+curl -i -X POST http://localhost:8000/api/v1/auth/login -H "Content-Type: application/json" -d '{"email": "test@example.com", "password": "SecurePassword123!"}'
+```
+- Without a paid domain, point `APP_BASE_URL` at `http://localhost:8000` and set `MAIL_FROM_ADDRESS=noreply@resend.dev` (Resend's shared test sender). Caveat: `@resend.dev` addresses are deliverable **only to the email account of the Resend account that owns the API key** — no other recipient will receive mail, and the API key must remain in `.env` only. Production still requires a verified custom domain per the Domain setup steps above.
+- To catch mail fully offline (no Resend calls), run a local SMTP catcher such as `python -m smtpd -c DebuggingServer -n localhost:1025` or MailHog (`docker run -p 8025:8025 mailhog/mailhog`) and stub the email service transport in tests instead of the real API.
+
+**Bounce / spam-folder handling**
+- Registration/login issues where mail never arrives: check the Resend dashboard Emails tab for the send's status (`delivered`, `bounced`, `complained`). Bounces list the SMTP diagnostic; common causes are an unverified domain, missing SPF/DKIM records, or a recipient-side block.
+- If mail lands in spam: verify DKIM/DMARC alignment for the sending domain, warm the domain gradually (keep early volume low), and avoid spammy link-only bodies. Verification/reset links must point at the real `APP_BASE_URL` (mismatched or localhost links in production look phishing-like).
+- Mail failures must never fail registration (`verification_email_sent: false` + sanitized log); after fixing DNS/API-key issues, have the user re-request via `POST /auth/verify-email/resend` (3/hour cap) rather than re-registering.
+- Never paste tokens, links or mail payloads into logs or issue reports (`FR-OPS-03`).

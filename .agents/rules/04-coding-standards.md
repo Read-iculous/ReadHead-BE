@@ -58,11 +58,13 @@ DEFAULT_PAGE_SIZE = 20
 ### List resource
 ```json
 {
-  "data": [...],
-  "total": 100,
-  "page": 1,
-  "page_size": 20,
-  "total_pages": 5
+  "data": {
+    "items": [...],
+    "total": 100,
+    "page": 1,
+    "page_size": 20,
+    "total_pages": 5
+  }
 }
 ```
 

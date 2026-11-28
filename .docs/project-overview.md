@@ -25,25 +25,34 @@ The system encompasses 12 functional feature groups (Features A through L):
 
 | Feature Code | Feature Name | Primary Purpose |
 |---|---|---|
-| **Feature A** | **Account & Session Management** (`FR-ACC-01~06`) | Registration, login, session validation, multi-account isolation on the same browser, and draft preservation upon session expiry. |
-| **Feature B** | **Onboarding & User Configuration** (`FR-CFG-01~07`) | First-time setup wizard, default AI provider, per-request overrides, proactive assistance toggles, privacy mode toggles, and settings synchronization. |
+| **Feature A** | **Account & Session Management** (`FR-ACC-01~06`) | Registration, login, session validation, multi-account isolation on the same browser, and draft preservation upon session expiry. Password accounts require **mandatory email verification via Resend** before login (docs complete, BE-19), including password reset with full session revocation. |
+| **Feature B** | **Onboarding & User Configuration** (`FR-CFG-01~07`) | First-time setup wizard, default AI provider, per-request overrides, UI/translation language preferences, proactive assistance toggles, privacy mode toggles, and settings synchronization. |
 | **Feature C** | **API Key Management (BYOK Vault)** (`FR-KEY-01~07`) | User-supplied API keys (max 1 active key per provider per account), pre-activation key validation, error isolation, envelope AES-256-GCM encrypted storage at rest, no plaintext logging. |
 | **Feature D** | **Content Extraction & Reading Context** (`FR-CNT-01~08`) | Ingest web text, selected snippets, and PDFs. Strict **tab-isolated context** (no cross-tab context pollution). No auto-fetching of stale URLs upon opening historical chats. |
 | **Feature E** | **AI Reading Assistance** (`FR-AI-01~12`) | Real-time SSE streaming for explain, translate, summarize, and multi-turn contextual Q&A. Strict source-grounding priority, uncertainty expression, and distinction between on-page facts vs external AI knowledge. |
-| **Feature F** | **Comprehension Questions** (`FR-CMP-01~05`) | Dynamic generation of multiple-choice comprehension check quizzes after reading milestones; answer evaluation and feedback. |
-| **Feature G** | **Proactive Reading Support & Personalization** (`FR-PRV-01~06`) | Non-intrusive proactive suggestions triggered by reading dwell time and complexity cues; customizable sensitivity or complete opt-out. |
+| **Feature F** | **Comprehension Questions** (`FR-CMP-01~05`) | Dynamic generation of multiple-choice comprehension check quizzes after reading milestones; answer evaluation and feedback, plus persistent quiz history with per-day statistics for the user dashboard (docs complete, BE-22). |
+| **Feature G** | **Proactive Reading Support & Personalization** (`FR-PRV-01~06`) | Non-intrusive proactive suggestions triggered by reading dwell time and complexity cues; customizable sensitivity or complete opt-out; per-paragraph dedup cache and explicit personalization consent (ADR-017, docs complete, BE-23). |
 | **Feature H** | **Privacy & Data Protection** (`FR-SEC-01~12`) | Pre-flight sensitive data inspection (PII, credentials, financial data) with default-block behavior, user override confirmation, domain blacklist policy, and privacy mode. |
-| **Feature I** | **Conversation History & Data Lifecycle** (`FR-HIS-01~10`) | Granular history management: delete single conversation, clear all history, delete account. Strict multi-tenant isolation; distinction between data protection and history storage. |
+| **Feature I** | **Conversation History & Data Lifecycle** (`FR-HIS-01~10`) | Granular history management: delete single conversation, bulk-delete all conversations (tombstone + sync), clear all history, export a personal data bundle, delete account. Strict multi-tenant isolation; distinction between data protection and history storage. |
 | **Feature J** | **Synchronization & Conflict Handling** (`FR-SYN-01~08`) | Multi-device sync for conversations, settings, and highlights; versioned conflict detection without silent overwriting. Local caching during network drops. |
 | **Feature K** | **Error Handling & Recovery** (`FR-ERR-01~10`) | Clear differentiation between key/quota errors, network failures, and upstream AI faults. Local preservation of unsent drafts; strict rule against silent automated re-submission. |
 | **Feature L** | **Monitoring & Operational Support** (`FR-OPS-01~05`) | Health probes (`/health`), operational metrics, diagnostic logging without sensitive data or decrypted keys. |
 
 ### Extended Platform Scope: Web Management Portal (Admin & User)
-- **User Dashboard (`/dashboard/*`)**: View cross-device reading stats, manage saved highlights, export reading notes, manage BYOK keys.
+- **User Dashboard (`/dashboard/*`)**: View cross-device reading stats, manage saved highlights, export reading notes, manage BYOK keys. Personal AI consumption is available via `GET /users/me/usage` daily/monthly aggregates (docs complete, BE-20; aggregate-only, Privacy-Mode-compatible). Quiz history and per-day score statistics are available via `GET /quiz` and `GET /quiz/stats` (docs complete, BE-22; Privacy-Mode quizzes excluded). Reading statistics and rule-based per-domain comprehension insights are available via `GET /reading/history/stats` and `GET /users/me/reading-insights` (docs complete, BE-24; on-the-fly aggregates, ADR-018). A full GDPR-style JSON data export is available via `GET /users/me/export` (docs complete, BE-25).
 - **Admin Management Portal (`/admin/*`)**:
   - *User Management*: Paginated user list, account status moderation (Active / Suspended / Banned), role management (`user` / `admin`).
   - *System Telemetry & Health*: Live overview of total requests, upstream AI provider distribution (OpenAI vs Gemini vs Claude), error rates, and user feedback satisfaction score.
   - *Privacy Guarantee*: Admin has zero access to user decrypted API keys, reading text, or private conversation logs.
+
+### Billing Statement (BYOK-Only — BR-39~41)
+ReadHead has **no billing relationship with its users**. The platform is strictly BYOK (Bring Your Own Key): every AI operation uses the user's own provider API key, stored encrypted in the BYOK Vault (Feature C). Consequently:
+- **No fees, subscriptions or paid tiers** are charged by ReadHead — there is no payment processing, invoicing or plan management anywhere in the backend.
+- **No usage quota is imposed by the platform** — request limits (rate limiting) exist only for abuse/availability protection, not for monetization; consumption ceilings are whatever the user's own provider plan permits.
+- **All LLM costs are borne directly by the user** with their own provider account (BR-39–41); ReadHead never proxies paid usage through its own credentials and never bills for token consumption. Usage aggregates (`usage_daily`, `GET /users/me/usage`) exist purely for the user's own visibility, not for charging.
+
+### Monitoring Scope Statement (SYS-FUN-062)
+Operational monitoring in the MVP is deliberately limited to **health probes** (`GET /health`, `GET /health/live` — endpoints §1.1–§1.2) and the **admin telemetry aggregate** (`GET /admin/telemetry` — §9.1). APM agents, Prometheus/Grafana metrics pipelines, distributed tracing and automated alerting are **out of scope** for the MVP (SYS-FUN-062; OpsCon out-of-scope). Diagnostic capability rests on correlation-request-ID logging and the documented runbooks (`commands.md`); extending monitoring is a future, explicitly-scoped effort.
 
 ---
 

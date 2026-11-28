@@ -25,27 +25,28 @@
 - **Context**: The backend needs to decrypt user API keys to make upstream calls on their behalf, so one-way hashing (like bcrypt) cannot be used. Key rotation must not cause downtime, and nonce reuse in GCM mode is catastrophic.
 - **Decision**: Store API keys encrypted using **AES-256-GCM** (Authenticated Encryption with Associated Data). Ciphertext is stored as `<version>:<base64_nonce>:<base64_ciphertext>:<base64_auth_tag>` (e.g. `v1:...`, `v2:...`). 
   1. **Strict Nonce Isolation**: Every encryption call MUST generate a cryptographically secure random 12-byte Nonce via `secrets.token_bytes(12)`. Static or predictable nonces are strictly prohibited to prevent GCM Nonce Reuse attacks.
-  2. **Keyring Support**: The application supports a Keyring dictionary (`ENCRYPTION_MASTER_KEYS={"v1":"...", "v2":"..."}`) allowing running workers to decrypt both old and new versions concurrently, while new writes always use `CURRENT_KEY_VERSION`. Fernet and CBC modes are explicitly eliminated.
+  2. **Rotation order**: Load both versions everywhere, switch all writers to the new version, migrate with ciphertext compare-and-swap, then verify zero old-version rows/writers before removing the old live key. Keep recovery keys for retained backups. Follow `.docs/development/commands.md` for the runbook.
+  3. **Keyring Support**: The application supports a Keyring dictionary (`ENCRYPTION_MASTER_KEYS={"v1":"...", "v2":"..."}`) allowing running workers to decrypt both old and new versions concurrently, while new writes always use `CURRENT_KEY_VERSION`. Fernet and CBC modes are explicitly eliminated.
 - **Consequences**:
   - *Pros*: Strong cryptographic security at rest with authentication tag verification preventing ciphertext tampering. Dual-key keyring enables 100% zero-downtime key rotation.
   - *Cons*: Keyring rotation requires keeping the old key in configuration until the background migration re-encrypts all database records.
 
 ---
 
-## ADR-004: Dual JWT Token Architecture (Access + Refresh Tokens)
-- **Status**: Accepted
-- **Context**: Extension users expect long-lived sessions without having to re-authenticate daily, while security requires short-lived access tokens.
-- **Decision**: Issue short-lived Access Tokens (15 minutes) and longer-lived Refresh Tokens (30 days) with token rotation on refresh, atomic Redis distributed locking (`lock:refresh:{token_hash}`), and a 30-second concurrency grace period. Database-backed token tracking allows immediate session revocation.
-- **Consequences**:
-  - *Pros*: Robust security profile; compromised access tokens expire rapidly; refresh tokens are rotated safely across concurrent tabs without triggering false-positive reuse detection; sessions can be invalidated instantly upon logout or administrative action.
-  - *Cons*: Extension needs token-refresh interceptors to handle 401s seamlessly.
+## ADR-004: Session-Scoped JWT Rotation and Failure Isolation
+- **Status**: Accepted; backend implemented, automated error/concurrency verification deferred.
+- **Decision**: Login/OAuth creates `auth_sessions`; access tokens last 15 minutes, refresh tokens 30 days, and both carry the same `sid` throughout a rotation chain. PostgreSQL session expiry/revocation is checked on authenticated requests and before returning any cached pair.
+- **Concurrency**: Redis lock `lock:refresh:{sid}:{token_hash}` uses a 5-second owner-checked lease, a post-acquisition cache recheck and a 2-second bounded wait. PostgreSQL session-row locking plus an atomic conditional token update is the final double-rotation guard, including Redis failure/lease expiry.
+- **Grace**: `refresh_grace:{sid}:{old_token_hash}` lasts 30 seconds and is indexed by `refresh_grace_keys:{sid}`. Logout revokes the whole session and its tokens, then cleans that session's exact cache keys. Cached pairs from a revoked session are unusable even if cleanup fails.
+- **Failure isolation**: Track token reasons `rotated`, `logout`, `security` and `revoked_at`. A missing rotation result within the grace interval returns `503 REFRESH_TEMPORARILY_UNAVAILABLE`; an older rotated token returns `401 REFRESH_TOKEN_REVOKED`. Neither cache failure nor lock contention alone revokes unrelated sessions. Explicit security events revoke affected sessions. Do not persist token-pair recovery copies in PostgreSQL in the MVP.
+- **Canonical protocol**: `.docs/technical/auth-flow.md` §2.3–2.5 specifies validation, temporary failures, refresh-only retries and cleanup.
 
 ---
 
 ## ADR-005: Hybrid Client/Server Storage Strategy
 - **Status**: Accepted
 - **Context**: Chrome extensions have access to `chrome.storage.local`, while cross-device sync requires cloud storage.
-- **Decision**: Store durable entities (User profile, encrypted API keys, chat history, highlights, bookmarks, privacy preferences) in PostgreSQL. Store volatile tab state, active DOM extract cache, and in-flight draft text locally in the browser extension.
+- **Decision**: Store durable entities (User profile, encrypted API keys, chat history, highlights, privacy preferences) in PostgreSQL. Store volatile tab state, active DOM extract cache, and in-flight draft text locally in the browser extension.
 - **Consequences**:
   - *Pros*: Minimal database bloat from transient page browsing; seamless synchronization for user value data across different browsers/machines.
 
@@ -67,10 +68,11 @@
 - **Decision**: Introduce integer `version` columns on synchronized records. Sync mutations execute an **Atomic Conditional SQL Update**:
   ```sql
   UPDATE conversations 
-  SET title = :title, version = version + 1, updated_at = NOW() 
+  SET title = :title, version = version + 1, updated_at = :sync_timestamp
   WHERE id = :id AND version = :base_version
   RETURNING id;
   ```
+  Allocate `:sync_timestamp` under the user-row lock according to ADR-013; filter by authenticated `user_id` in the real query.
   If affected rows == 0, the server immediately raises a `409 SYNC_CONFLICT` error with both versions, strictly preventing silent data loss without requiring table-level locks.
 - **Consequences**:
   - *Pros*: Strictly complies with `FR-SYN-05` ("System SHALL NOT silently overwrite preserved data") and eliminates multi-thread race conditions.
@@ -102,12 +104,12 @@
 - **Status**: Accepted
 - **Context**: Access Tokens have a 15-minute lifetime. When an admin bans an account or a user deletes their profile, waiting for JWT expiration creates a security risk. Conversely, if Redis experiences downtime, hard-failing readiness probes (503) causes Kubernetes/Ingress to kill routing, preventing built-in database fallbacks from executing.
 - **Decision**:
-  1. **New Requests & Token Revocation**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` auth dependency performs a sub-millisecond Redis check and rejects revoked users with `401 USER_SUSPENDED`.
-  2. **Active Streams**: Running SSE async generators inspect user revocation status between yielded tokens. Upon detecting a revocation event, the generator immediately yields an `event: error` (`USER_SUSPENDED`) and terminates the stream.
+  1. **New Requests & Token Revocation**: Store immediate revocation markers in Redis key `revoked_users:{user_id}` with TTL = 3600 seconds whenever an account is suspended, banned, or deleted. The `get_current_user` dependency checks Redis markers plus authoritative PostgreSQL user/session validity. Suspended users return `401 USER_SUSPENDED`; revoked access-token sessions return `401 UNAUTHORIZED`.
+  2. **Active Streams**: Running SSE async generators inspect user and session revocation markers between yielded tokens. User suspension/deletion emits `event: error` (`USER_SUSPENDED`); session logout emits `UNAUTHORIZED`. The stream then terminates. Redis outage follows the degraded-mode exception below.
   3. **Readiness Probe & Degraded Mode Policy**:
      - PostgreSQL is a **hard dependency**: if DB is unreachable, `/api/v1/health` returns `503 Service Unavailable`.
      - Redis is a **soft dependency with graceful degradation**: if Redis is unreachable while DB is healthy, `/api/v1/health` returns `200 OK` with status `"degraded"` (`{"status": "degraded", "checks": {"database": {"status": "healthy"}, "redis": {"status": "unhealthy"}}}`). This keeps pods in rotation while degrading non-critical features:
-       - *Auth*: Bypasses Grace Cache and checks revocation directly against PostgreSQL.
+       - *Auth*: Checks user/session revocation directly against PostgreSQL. Refresh uses the same DB session-row lock and conditional update; unavailable rotation results return `503 REFRESH_TEMPORARILY_UNAVAILABLE` without global logout (ADR-004).
        - *Rate Limiting*: Falls back to local in-memory sliding window or permits requests.
        - *Streaming Concurrency*: Bypasses multi-stream restriction temporarily; active streams ignore Redis connection loss mid-stream and continue delivering tokens to completion.
        - *Ephemeral Quizzes*: Returns `503 SERVICE_DEGRADED` as quizzes in Privacy Mode require caching.
@@ -120,7 +122,7 @@
 - **Status**: Accepted
 - **Context**: Unbounded long-lived SSE connections can exhaust backend workers. PDF document uploads can balloon server disk/RAM. Untrusted web page text can harbor prompt injection attacks against LLMs.
 - **Decision**:
-  1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (`slowapi`) apply strictly to the initial HTTP handshake.
+  1. **SSE Concurrency**: Enforce a maximum of **2 active concurrent SSE streams** per user (`active_streams:{user_id}` in Redis); excess streams reject with `429 STREAM_CONCURRENCY_EXCEEDED`. Rate limits (native async Redis fixed windows) apply strictly to the initial HTTP handshake.
   2. **Zero-Binary PDF Handling**: Browser extension extracts clean text locally using bundled Mozilla `pdf.js` (max 102,400 bytes UTF-8 text extract); zero raw PDF binaries are uploaded to the backend.
   3. **Prompt Injection Fencing**: Backend wraps web-derived contexts in XML delimiter tags (`<untrusted_web_context>` and `<user_selected_text>`) with immutable system prompt instructions commanding the LLM to treat inner text purely as passive reference data.
 - **Consequences**:
@@ -136,6 +138,7 @@
   1. **Session Identification & Explicit Bind Flow**:
      - Browser tabs generate a `reading_session_id` (UUIDv4) stored in tab `sessionStorage`.
      - When opened from the dashboard or history list, `conversations.reading_session_id` defaults to `NULL` (unbound readonly mode).
+     - Continuing an existing standard-mode conversation requires non-null matching stored/requested session IDs. An unbound conversation remains read-only even when the request also omits its session ID (`400 TAB_CONTEXT_MISMATCH`).
      - To interact with an existing conversation from an active tab, the client sends `POST /api/v1/ai/conversations/{id}/bind` passing its `reading_session_id`.
      - If the conversation is currently streaming tokens in another tab, the bind request is rejected with `409 CONVERSATION_BUSY`.
      - When history is cleared (`page_url IS NULL`), any tab can bind to the conversation and context checking against the original URL is bypassed.
@@ -150,25 +153,15 @@
 
 ---
 
-## ADR-013: Multi-Entity Sync Pagination & 30-Day Tombstone Expiration
-- **Status**: Accepted
-- **Context**: Synchronizing three distinct entity types (`conversations`, `highlights`, `settings`) through a single cursor created pagination ambiguity. Additionally, soft-deleted tombstones are purged after 30 days, creating a data desynchronization risk for devices offline for extended periods (> 30 days).
-- **Decision**:
-  1. **Multi-Entity Pagination**: Standardize `POST /api/v1/sync/pull` to return independent Composite Cursors per entity group:
-     ```json
-     "next_cursors": {
-       "conversations": "c_base64...",
-       "highlights": "h_base64...",
-       "settings": "s_base64..."
-     }
-     ```
-     Alternatively, batch slicing applies `limit` across a unified timestamp change stream ordered by `(updated_at, entity_type, entity_id)` ensuring deterministic pagination without missing updates during concurrent writes.
-  2. **30-Day Tombstone Expiry & Full Resync Mandate**:
-     - Database cleans up soft-deleted records (`is_deleted = TRUE`) older than 30 days.
-     - If an offline client attempts an incremental sync with a cursor older than 30 days (`cursor_timestamp < NOW() - INTERVAL '30 days'`), the backend rejects the pull with `410 CURSOR_EXPIRED` and payload `{"requires_full_sync": true}`.
-     - The client extension must wipe its local cache and perform a full initial resynchronization, preventing stale deleted records from persisting locally forever.
-- **Consequences**:
-  - *Pros*: Guarantees data consistency across long-dormant devices and clear pagination semantics across multiple entity types.
+## ADR-013: One Unified Sync Cursor and Non-Destructive Full Resync
+- **Status**: Accepted; backend implemented, automated error/concurrency verification deferred.
+- **Decision — one cursor**: Merge user-owned `conversations`, `highlights` and `user_settings` rows (including tombstones) with `UNION ALL`, label their `entity_type` as `conversation`, `highlight`, `settings`, and order by `(updated_at ASC, entity_type ASC, id ASC)`. `limit` (1–100) applies to the combined result, not to each table. Messages are fetched separately. Only `cursor`/`next_cursor` exist; there are no per-entity cursor fields.
+- **Opaque cursor format**: Base64url JSON with `v: 1`, `kind`, `t` and `anchor`. A `position` cursor additionally contains `entity_type` and a full UUID `id`; it resumes strictly after that tuple. A `checkpoint` cursor resumes at `updated_at > t`. `anchor` is the time of the previous completed checkpoint, or the initial full-pull start time, and stays unchanged throughout pagination. Validate fields/types and reject unsupported/malformed cursors with `400 INVALID_SYNC_CURSOR`; queries always filter by the authenticated user.
+- **Concurrent writes and commit order**: All synchronized writes (including direct REST operations, user settings creation, message appends, history clearance, soft deletes and sync push) first lock the owning `users` row using `SELECT ... FOR UPDATE` in a short transaction. Allocate a timestamp `GREATEST(clock_timestamp(), users.sync_clock + INTERVAL '1 microsecond')`, update `users.sync_clock`, and stamp changed synchronized rows with that value. Preserve the existing conditional `version` update. Acquire the user lock before entity locks and hold it through commit. Never stamp these writes solely with transaction-start `NOW()`.
+- **Pull algorithm**: Each page obtains the same user row lock before reading the merged result. Fetch `limit + 1` rows to compute `has_more`; return at most `limit`, grouped into the documented response arrays/object. If more rows exist, `next_cursor` is a `position` at the last returned tuple, retaining `anchor`. Otherwise advance `users.sync_clock` with the allocator and return a `checkpoint` whose `t` and `anchor` equal that allocated value, even for an empty page. Commit and release the lock before returning. Thus a later writer must receive a timestamp after the completed checkpoint, including after a slow transaction or clock rollback. A row changed again between pages may be delivered again at a higher version; the client upserts by ID/version. This synchronizes latest state, not an audit log of every intermediate edit.
+- **Retention**: Retain tombstones at least 30 days from their deletion/update timestamp. The purge job takes the same user lock. Reject a cursor if `anchor` is older than 30 days with `410 CURSOR_EXPIRED` and `requires_full_sync: true`. A full pull (`cursor: null`) includes current live rows; expired clients must rebuild their synced cache. Initial pagination uses the full-pull start as `anchor`, so old live rows do not themselves cause expiration.
+- **Non-destructive resync**: Preserve credentials, drafts, ephemeral tab state and pending mutations. Build a new user-scoped synced cache in staging storage from `cursor: null`, then atomically replace only the old synced cache and install the completed checkpoint after every page succeeds. On failure retain the previous cache, cursor and pending work. New edits during the rebuild remain queued separately. Reconcile pending mutations against fresh server versions; stale edits/deletes surface conflicts and require resolution, never silent overwrite or resurrection. Do not replay queued AI requests. Account logout/switch still follows the separate account-isolation purge rule.
+- **Scope**: `users.sync_clock` is server-only metadata and is not part of user profile/settings mutation payloads. No long-lived DB snapshot/connection is held across HTTP pages.
 
 ---
 
@@ -179,17 +172,121 @@
   1. **Phase 1 (Pre-stream DB Transaction)**:
      - Check out transient DB session.
      - Authenticate user, decrypt BYOK key, verify tab session ownership.
-     - If standard mode: Create conversation (if new) and insert `user message` into `messages` table. Commit transaction and close DB session.
+     - If standard mode: Create conversation (if new) and insert `user message` into `messages` table. Allocate the sync timestamp and increment the conversation version for this append under the ADR-013 user-row lock; commit and close the DB session.
   2. **Phase 2 (Streaming Loop - Zero DB Connection)**:
      - Stream LLM tokens via SSE (`event: start`, `event: token`, `event: citation`).
      - Inspect Redis cancellation flags without DB connection.
   3. **Phase 3 (Post-stream DB Commit BEFORE Event Done)**:
      - Stream generation finishes from LLM.
      - Check out fresh transient DB session.
-     - Insert `assistant message`, increment `conversation.version = version + 1`, update `conversation.updated_at = NOW()`.
+     - Insert `assistant message`, increment `conversation.version = version + 1`, update `conversation.updated_at` using the ADR-013 sync timestamp allocator.
      - Commit DB transaction.
      - **Only after DB commit successfully finishes**, dispatch `event: done` to client.
-     - **Failure Handling**: If the database commit fails, do NOT send `event: done`. Instead, dispatch `event: error` with code `PERSISTENCE_FAILED`. The client keeps the assistant reply in local memory/UI and displays a retry persistence prompt.
+     - **Failure Handling**: If the database commit fails, do NOT send `event: done`. Instead, dispatch `event: error` with code `PERSISTENCE_FAILED`. For the MVP, the client keeps the reply in the current UI memory, labels it "Not saved", and allows copying. No retry-save endpoint or automatic AI replay exists. In Privacy Mode, do not persist this UI text outside the declared ephemeral storage.
   4. **Privacy Mode**: Skip DB writes in Phase 1 and Phase 3 entirely; dispatch `event: done` immediately after LLM finishes streaming.
 - **Consequences**:
   - *Pros*: Zero pool starvation, guaranteed message persistence before client receives success signal, clear error handling on storage failures.
+
+---
+
+## ADR-015: Mandatory Email Verification via Resend, Hashed Tokens & Reset-Driven Revocation
+- **Status**: Accepted (docs complete; NOT implemented — BE-19)
+- **Context**: Password accounts could previously log in immediately after registration, leaving unverified/throwaway email addresses in the user base. Password recovery did not exist, and admins had no way to help users regain access. Transactional email requires a deliverable sending domain and abuse-resistant token handling.
+- **Decision**:
+  1. **Provider**: Send all transactional email (verification, reset, provider-link notifications) through **Resend** via its HTTPS REST API using direct `httpx` calls — matching the project's existing direct-httpx pattern for simple JSON integrations; no dedicated SDK. Configure SPF/DKIM/DMARC for the sending domain.
+  2. **Mandatory verification**: Password registration creates the account with `is_verified = FALSE`, dispatches the verification email fire-and-forget (3 retries with exponential backoff; mail failure NEVER fails registration), and login stays blocked with `403 EMAIL_NOT_VERIFIED` (broadened: password login AND unverified-provider OAuth) until the emailed token is consumed. OAuth (Google/GitHub) accounts are verified by their provider.
+  3. **Tokens hashed-at-rest**: Verification/reset tokens are 256-bit URL-safe CSPRNG values; the database stores only their SHA-256 hex digests (`email_verification_tokens` / `password_reset_tokens`, migration `0004`). Plaintext tokens exist solely inside email links. Single-use (`used_at`), TTL-bounded (24h verification / 60-minute reset), constant-time comparison.
+  4. **Revoke-all-on-reset**: A successful password reset consumes the token and revokes EVERY `auth_sessions` row of the user with reason `security`, reusing the ADR-004/auth-flow §2.5 revocation mechanism; all devices must sign in again.
+  5. **Anti-abuse**: Neutral always-200 forgot/resend responses with stable timing (anti-enumeration), 3/hour per-email resend cap plus the shared auth bucket (email bombing), uniform 401 login failures (credential stuffing), and no token/mail-payload logging (`FR-OPS-03`).
+- **Consequences**:
+  - *Pros*: Verified email as an account-recovery and trust anchor; database leaks yield no usable links; stolen sessions die on password reset; deliverability managed by Resend.
+  - *Cons*: Users must reach their inbox before first login; Resend becomes a soft external dependency (failures degrade to `verification_email_sent: false`, never block registration); DNS records must be maintained.
+
+---
+
+## ADR-016: Backend-Mediated Usage Tracking via Daily Aggregates (Privacy-Compatible)
+- **Status**: Accepted (docs complete; NOT implemented — BE-20)
+- **Context**: Users need visibility into their AI consumption, but per-message usage records would create a content-linked telemetry trail — unacceptable for Privacy Mode — and admin per-user usage views would violate the project's privacy guardrails.
+- **Decision**:
+  1. **Aggregate-only storage**: After each completed generation, upsert-increment one row per `(user_id, date, provider, model)` in `usage_daily` (migration `0005`): `request_count`, `input_tokens`, `output_tokens`. No message IDs, URLs, prompts or response text are recorded, so the aggregate carries zero content linkage.
+  2. **Provider metadata**: Parse the terminal frame of each provider — OpenAI (requires `stream_options.include_usage`), Anthropic (`message_delta`), Gemini (`usageMetadata`). Missing metadata stays `null` in the done event (`total_tokens` remains nullable as today; `input_tokens`/`output_tokens` are added) and stores zeros in the aggregate — never fabricated.
+  3. **Privacy Mode compatibility**: Private-mode generations still increment usage (pure counters, no content rows), unlike conversation/message writes which are skipped entirely.
+  4. **Access**: `GET /users/me/usage?period=day|month&from=&to=` serves the authenticated owner only. Admins see NO per-user usage in the MVP — admin telemetry remains aggregate and content-free. `usage_daily` and api-keys are out of `/sync` scope.
+- **Consequences**:
+  - *Pros*: User-facing consumption transparency with a single bounded table; Privacy Mode contract intact; minimal admin privacy surface.
+  - *Cons*: Streams cancelled before the terminal frame are under-counted (accepted and documented); per-request (sub-daily, per-message) analytics are impossible retroactively.
+
+---
+
+## ADR-017: Personalization Consent & Proactive Dedup (docs complete; NOT implemented — BE-23)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: Personalizing assistance (adapting explanation level/detail to reading proficiency, improving proactive suggestions) requires using `reading_history` and AI interactions. Privacy Mode only stops *new* history writes and does not express consent to *use* existing data for personalization. Separately, ISSUE-043 showed `POST /ai/proactive-suggest` calling the LLM on every eligible dwell event, so a retry loop can burn user quota.
+- **Decision**:
+  1. **Consent column**: `user_settings.personalization_consent BOOLEAN NOT NULL DEFAULT FALSE` (migration `0006`). Opt-in only; default off. **Independent of `privacy_mode_enabled`** — neither flag implies or toggles the other. Revocation sets the flag to `FALSE` and does NOT delete previously stored data (the client prompts the user about existing data). The flag is part of the synchronized `settings` entity, so revocation propagates to all devices, and takes effect immediately.
+  2. **Enforcement rule**: Every current and future code path that uses `reading_history` or AI interactions for personalization MUST re-read `personalization_consent` under the same `users` row lock used by settings updates (the ISSUE-015 stale-snapshot pattern) and skip personalization when it is `FALSE`. Admins see no personalization data or consent-derived views.
+  3. **Purpose bound**: Consent covers exactly: (a) adapting explanation level / answer detail to the user's reading proficiency, and (b) improving proactive suggestions. Any new purpose requires revisiting this ADR.
+  4. **Proactive dedup**: A Redis-only TTL cache keyed `(user_id, paragraph_hash)` (SHA-256 of the normalized paragraph) with TTL 300 seconds (5 minutes). A cache hit returns `{has_suggestion: false}` without any LLM call; the key is written only after a successfully generated suggestion. The cache is never persisted to PostgreSQL, is not part of `/sync`, and degrades silently (dedup skipped) during Redis outages. This closes ISSUE-043 (resolved-in-docs).
+- **Consequences**:
+  - *Pros*: Explicit, auditable consent basis for personalization; users keep their data when revoking; quota-abuse loops cannot multiply proactive LLM calls; zero schema cost for the dedup cache.
+  - *Cons*: A 5-minute window means the same paragraph can trigger one repeated suggestion per window (accepted); consent re-reads add a lock read to personalization paths.
+
+---
+
+## ADR-018: Comprehension Insights — Rule-Based, On-The-Fly Aggregates (docs complete; NOT implemented — BE-24)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: The product wants a second-tier "Comprehension Insight" (Tầng 2) that tells users which domains they struggle with and lets proactive assistance adapt accordingly. A dedicated insight table or an ML pipeline would add schema, retention and privacy costs disproportionate to an MVP, and `messages` lacks a `task` column to attribute assistance requests precisely.
+- **Decision**:
+  1. **On-the-fly aggregation, no new tables, no ML**: Insights are computed per `(user, domain)` at request time from `quiz_records` (quiz scores/trend) and `messages`⋈`conversations` (user-turn assistance frequency). `reading_history` dwell time is only a secondary corroborating signal — it never raises the difficulty signal alone (false-positive guard). Deleting the underlying data resets signals automatically because nothing is cached or materialized.
+  2. **Access**: `GET /users/me/reading-insights?from&to` (endpoints §3.8) returns per-domain `{avg_quiz_score, quiz_trend, assist_request_rate, difficulty_signal, sample_size, has_sufficient_data}`. All thresholds (quiz windows, 0.6 decay floor, normalized turn ratios, `has_sufficient_data` minima of 2 submitted quizzes / 3 user turns) are configuration constants/env values, not hard-coded logic. Rate bucket: general API bucket.
+  3. **Consent gate (ADR-017 boundary)**: *Viewing* one's own insight requires NO consent (it is the user's own data). *Using* the insight to modulate AI behavior — the optional `insight` field on `POST /ai/proactive-suggest` (§5.3) — requires `personalization_consent == true`, re-read under the user row lock at the point of use (ADR-017 enforcement rule).
+  4. **Anti-spam (layer 3)**: Insight-driven proactive enrichment is capped at **2 per day per domain** via a Redis counter with a 24h TTL; a dismissal of this suggestion type caches a 24h suppression for that `(user, domain)`. Both are Redis-only (degraded mode skips them), never persisted, and never part of `/sync`. When the cap is reached the ordinary hint still works under the existing 5-minute dedup cache.
+  5. **Privacy Mode**: While enabled, no new signals are written; aggregates read only previously stored rows.
+- **Limitations (explicit)**:
+  - `messages` lacks a `task` column, so `assist_request_rate` proxies assistance requests with **user-turn counts** per domain. Adding a `task` column is deferred to a future migration (would then require re-baselining the normalization).
+  - Dwell/reading time is not normalized by word count, so raw dwell is deliberately restricted to a weak secondary signal pending the BC-08 KPI work.
+- **Consequences**:
+  - *Pros*: Zero schema cost (no new table, migration `0007` only drops the unused bookmark column); deterministic and auditable rules; instant reset on data deletion; consent/privacy boundaries reuse ADR-017 mechanisms unchanged.
+  - *Cons*: Rule-based signals are coarser than ML models and cannot retro-analyze before data existed; user-turn proxy over-counts multi-turn chats per domain; thresholds need tuning via configuration as real usage lands.
+
+---
+
+## ADR-019: Role Management Bootstrap via CLI (no role-change API)
+- **Status**: Accepted (CLI promotion behavior is implemented; the no-API rule is binding for future work)
+- **Context**: The Admin Portal spec lists "role management (`user` / `admin`)" among portal capabilities. Any API endpoint that promotes an existing account to `admin` becomes a self-service escalation surface: a compromised admin credential (or a bug in the endpoint's authorization) converts one stolen session into permanent platform control, and role changes made over HTTP are invisible unless a separate audit mechanism is built first. The MVP already has a working, operator-controlled path: `python -m app.cli.create_admin` (see `.docs/development/setup.md` §2.5 and `.docs/development/commands.md` §5).
+- **Decision**:
+  1. **CLI-only role promotion**: The only supported way to create or elevate an administrator is the CLI (`app/cli/create_admin.py`). Promoting an *existing* account is deliberately **refused** by the CLI — it bootstraps a new admin account instead, so an attacker with server access cannot silently escalate an already-active user account that may have curated history.
+  2. **No role-change endpoint**: No `PATCH /admin/users/{id}/role` (or equivalent) will be implemented in the MVP. Demotion/de-provisioning of an admin is an operator action performed directly against the database (or by deleting the account), outside the API surface.
+  3. **Re-read authorization**: `require_admin` re-reads the user's role from the database on every request (no role claims trusted from JWT), so a demoted or suspended admin loses access immediately.
+- **Consequences**:
+  - *Pros*: No HTTP escalation surface; promotion requires server-level access, which is a strictly stronger trust boundary; smallest possible MVP scope; the CLI path is already tested and documented.
+  - *Cons*: Operating an admin lifecycle (new admin, lost credentials of a second admin) requires shell access to the deployment host; a future multi-tenant/hosted offering would need to revisit this ADR together with ADR-020's audit trail.
+
+---
+
+## ADR-020: Admin Audit Trail — Append-Only `admin_audit_logs` (docs complete; NOT implemented — BE-27)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: Moderation actions (suspend/ban/reactivate §9.3, admin-triggered password reset §9.5) and CLI role promotion (ADR-019) currently leave at best a log line. Without a durable, queryable record there is no way to answer "who banned whom, when" after an incident, and the last-admin lockout rule (§9.3) cannot be reviewed. A full admin UI for audit browsing is disproportionate to the MVP.
+- **Decision**:
+  1. **One append-only table**: `admin_audit_logs` (schema §2.16, migration `0008`): `actor_user_id` (FK users, cascade), nullable `target_user_id` (FK users, set-null — NULL for CLI-wide actions), `action` enum (`user_status_changed`, `password_reset_link_sent`, `role_promoted_cli`, ...), `details` JSONB (e.g. `old_status`/`new_status`), nullable `request_id`, `created_at`. Indexes `(actor_user_id, created_at DESC)` and `(target_user_id)`. No update/delete path exists in the MVP.
+  2. **Logged actions**: every accepted `PATCH /admin/users/{id}/status` change (suspend/ban/reactivate, including admin-on-admin), a successful `POST /admin/users/{id}/send-reset-link` dispatch (once BE-19 code lands), and CLI role promotion — the CLI writes its row directly with `request_id = NULL`.
+  3. **Read surface, not UI**: `GET /admin/audit-logs` (endpoints §9.6, admin-only, paginated, filterable by `action`/`target_user_id`) answers accountability queries; there is **no frontend UI in the MVP** — operators may also query via `psql`.
+  4. **Retention: 90 days**. The cleanup job is *planned* and deferred to a later task; BE-27 ships the table and writes only.
+  5. **Last-admin lockout (companion rule)**: `PATCH /admin/users/{id}/status` rejects suspending or banning the last active administrator with `400 LAST_ADMIN_LOCKOUT`, so the platform always retains at least one active admin; admin-on-admin moderation of *other* admins stays allowed (and is audited).
+  6. **Privacy boundary**: rows are behavioral metadata of moderation actions only — outside the Privacy Mode storage matrix, which governs user reading/conversation content.
+- **Consequences**:
+  - *Pros*: Durable accountability for every status change and promotion; simple additive migration; queryable without UI; retention is bounded by policy.
+  - *Cons*: 90-day retention is unenforced until the cleanup job lands; accountability depends on the table actually being written by every future admin action (a review rule, not an enforcement mechanism); no UI means ad-hoc `psql` access for operators.
+
+---
+
+## ADR-021: MVP Decision Set — Language List, Mixed-Sensitive Handling, Token TTLs (approved 2026-11-29)
+- **Status**: Accepted (approved 2026-11-29)
+- **Context**: The project lead finalized three previously open MVP questions on 2026-11-29: (a) the supported translation language list, which had only been used implicitly across `.docs/api/endpoints.md` and `.docs/api/error-codes.md` without formal approval; (b) how to handle an outbound request that contains both sensitive and non-sensitive content in the Feature H pre-flight check; and (c) the token TTLs planned under BE-19.
+- **Decision**:
+  1. **Supported translation language list is final**: `vi, en, ja, zh, ko, fr, de, es`. These eight languages were previously used implicitly across `.docs/api/endpoints.md` and `.docs/api/error-codes.md`; they are now formally approved. Extending the list requires a BRS revisit. `ui_language` remains `{vi, en}`.
+  2. **Requests containing both sensitive and non-sensitive content are blocked in their entirety** (`400 SENSITIVE_DATA_DETECTED`): there is no partial-allow or auto-sanitize mechanism in the MVP. The user must edit/remove the sensitive parts and manually resend. This aligns with FR-SEC-06 and the existing check-sensitive flow, and no auto-resubmission is performed (FR-SEC-08; consistent with ADR-009's no-silent-retry rule).
+  3. **Token TTLs (BE-19)**: email verification tokens last **24 hours**; password reset tokens last **30 minutes** (this supersedes the 60-minute reset value noted in ADR-015 and `.docs/technical/environment-variables.md`, whose table is to be updated when BE-19 lands). Admin audit-log retention stays **90 days** (ADR-020).
+- **Consequences**:
+  - *Language list*: adding a new translation language later is a contract change (settings and `target_language` validation, `400 UNSUPPORTED_LANGUAGE`) plus FE i18n work — not a configuration toggle.
+  - *Mixed content*: block-all favors safety over UX — the whole request is rejected even when only a fragment is sensitive, and the user must manually edit and resend; nothing is transmitted to providers without explicit user action.
+  - *TTLs*: 24h verification / 30-minute reset are environment-configurable defaults (`VERIFICATION_TOKEN_TTL_HOURS`, `PASSWORD_RESET_TOKEN_TTL_MINUTES`); audit-log retention remains bounded at 90 days per ADR-020.

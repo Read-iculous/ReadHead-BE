@@ -4,6 +4,7 @@
 ```txt
 # Core Framework
 fastapi>=0.110.0,<1.0.0
+anyio>=4.0.0,<5.0.0  # cancellation-safe bounded upstream cleanup
 uvicorn[standard]>=0.28.0,<1.0.0
 pydantic>=2.6.0,<3.0.0
 pydantic-settings>=2.2.0,<3.0.0
@@ -14,11 +15,11 @@ asyncpg>=0.29.0,<1.0.0
 alembic>=1.13.1,<2.0.0
 
 # In-Memory Cache & Rate Limiting
-redis>=5.0.3,<6.0.0
-slowapi>=0.1.9,<1.0.0
+redis>=5.0.3,<6.0.0  # custom fixed-window limiter in app/core/limiter.py
 
 # Security, Cryptography & Auth
 passlib[bcrypt]>=1.7.4
+bcrypt>=4.0.1,<4.1  # compatible with passlib 1.7.x
 python-jose[cryptography]>=3.3.0
 cryptography>=42.0.5
 authlib>=1.3.0
@@ -30,6 +31,12 @@ httpx>=0.27.0,<1.0.0
 openai>=1.14.0
 google-generativeai>=0.4.1
 anthropic>=0.20.0
+
+# Transactional Email (Resend)
+# Delivered via direct httpx HTTPS calls to https://api.resend.com/emails.
+# The official `resend` Python SDK is intentionally NOT adopted: it is a thin
+# wrapper over the same JSON REST API, and this project already prefers direct
+# httpx for simple request/response integrations (see the Gemini and OAuth precedent below).
 ```
 
 ## 2. Development & Testing Dependencies (`requirements-dev.txt`)
@@ -46,3 +53,9 @@ mypy>=1.9.0
 ## 3. Dependency Pinning & Upgrades
 - Use semantic versioning ranges in specifications, but lock exact versions using `pip-tools` (`requirements.txt` compiled from `requirements.in`) or Poetry/Pipenv when locked down.
 - Always review major version bumps of `openai`, `google-generativeai`, and `anthropic` to catch any breaking changes in streaming interfaces.
+
+The initial declared provider/OAuth packages remain available, but Gemini and OAuth use `httpx` directly. Native async Redis limiting is implemented instead of invoking synchronous SlowAPI storage. `pyproject.toml` enables the Pydantic Mypy plugin; the passlib-compatible bcrypt bound is explicit in `requirements.txt`.
+
+**Resend email delivery** follows the same pattern: verification and password-reset emails are sent with `httpx` directly against Resend's HTTPS REST API (`POST https://api.resend.com/emails`, bearer `RESEND_API_KEY`). No new package is added. The official `resend` SDK wraps the identical JSON endpoint; adopting it would add a dependency without benefiting from SDK-level streaming, retries or protocol complexity that the AI provider SDKs justify. Send failures are handled in the application layer (3 retries with exponential backoff, fire-and-forget from registration; see `.docs/technical/auth-flow.md` §2.7).
+
+AnyIO is an explicit runtime dependency for bounded shielded stream/client cleanup. Focused offline regressions coexist with opt-in PostgreSQL/Redis integration tests. `python tests/run_integration.py` provisions disposable storage and runs installed provider SDKs with synthetic upstream HTTP responses. The wire fixture uses each SDK's native HTTP transport (`httpx` or `httpx2`) to avoid mistaking transport-fixture incompatibilities for application defects. The full BE-17 plan and coverage target remain incomplete; real external AI/OAuth success requires live credentials.

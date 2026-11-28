@@ -138,8 +138,7 @@ uvicorn[standard]
 sqlalchemy[asyncio]
 alembic
 asyncpg               # PostgreSQL async driver
-redis                 # Async Redis 7+ client
-slowapi               # Rate limiting middleware
+redis                 # Async Redis 7+ client + custom fixed-window limiter
 pydantic-settings     # Settings management (v2)
 python-jose[cryptography]  # JWT
 cryptography          # AES-256-GCM symmetric encryption

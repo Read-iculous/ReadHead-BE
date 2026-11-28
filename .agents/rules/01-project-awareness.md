@@ -2,8 +2,7 @@
 
 ## Project Overview
 ReadHead-BE is the backend API server for the ReadHead platform. The project is in its **early stage** —
-specification documents exist but no code has been written yet. The agent's role is to help build
-the backend according to those specifications.
+the backend source now implements the documented roadmap except the explicitly deferred BE-17 automated test suite. See `.docs/development/implementation-status.md` for verification limits and remaining client/provider setup.
 
 ## Position in the System
 ```
@@ -32,8 +31,8 @@ The following files contain the original project specifications, located at the 
 ## Project Status
 - [x] Specification documents: ✅ Available (docx)
 - [ ] `.docs/` markdown: 🔄 In progress
-- [ ] Backend code: ⏳ Not started
-- [ ] Tests: ⏳ Not started
+- [x] Backend code: implemented for BE-01–BE-16 and BE-18
+- [ ] Automated error/integration tests and coverage: explicitly deferred by the user; basic successful runtime checks performed
 - [ ] Deployment: ⏳ Not started
 
 ## Key Constraints
