@@ -31,6 +31,12 @@ httpx>=0.27.0,<1.0.0
 openai>=1.14.0
 google-generativeai>=0.4.1
 anthropic>=0.20.0
+
+# Transactional Email (Resend)
+# Delivered via direct httpx HTTPS calls to https://api.resend.com/emails.
+# The official `resend` Python SDK is intentionally NOT adopted: it is a thin
+# wrapper over the same JSON REST API, and this project already prefers direct
+# httpx for simple request/response integrations (see the Gemini and OAuth precedent below).
 ```
 
 ## 2. Development & Testing Dependencies (`requirements-dev.txt`)
@@ -49,5 +55,7 @@ mypy>=1.9.0
 - Always review major version bumps of `openai`, `google-generativeai`, and `anthropic` to catch any breaking changes in streaming interfaces.
 
 The initial declared provider/OAuth packages remain available, but Gemini and OAuth use `httpx` directly. Native async Redis limiting is implemented instead of invoking synchronous SlowAPI storage. `pyproject.toml` enables the Pydantic Mypy plugin; the passlib-compatible bcrypt bound is explicit in `requirements.txt`.
+
+**Resend email delivery** follows the same pattern: verification and password-reset emails are sent with `httpx` directly against Resend's HTTPS REST API (`POST https://api.resend.com/emails`, bearer `RESEND_API_KEY`). No new package is added. The official `resend` SDK wraps the identical JSON endpoint; adopting it would add a dependency without benefiting from SDK-level streaming, retries or protocol complexity that the AI provider SDKs justify. Send failures are handled in the application layer (3 retries with exponential backoff, fire-and-forget from registration; see `.docs/technical/auth-flow.md` §2.7).
 
 AnyIO is an explicit runtime dependency for bounded shielded stream/client cleanup. Focused offline regressions coexist with opt-in PostgreSQL/Redis integration tests. `python tests/run_integration.py` provisions disposable storage and runs installed provider SDKs with synthetic upstream HTTP responses. The wire fixture uses each SDK's native HTTP transport (`httpx` or `httpx2`) to avoid mistaking transport-fixture incompatibilities for application defects. The full BE-17 plan and coverage target remain incomplete; real external AI/OAuth success requires live credentials.

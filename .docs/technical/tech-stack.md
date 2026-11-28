@@ -21,6 +21,7 @@
 | **Password Hashing** | `passlib[bcrypt]` | Secure salted bcrypt hashing for email/pass auth |
 | **Key Vault Encryption** | `cryptography` (AES-256-GCM) | Symmetric encryption of user-provided LLM API keys |
 | **OAuth2 Clients** | `httpx` + `authlib` | Google & GitHub OAuth2 token exchange and profile fetch |
+| **Transactional Email** | `httpx` (direct REST) | Email verification & password-reset delivery via the Resend HTTPS API (`RESEND_API_KEY`); no dedicated SDK (see `.docs/technical/dependencies.md`) |
 
 ## 3. External AI Integration
 | Provider | Integration Method | Supported Models (Initial) |

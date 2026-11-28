@@ -40,7 +40,7 @@ app/
 │   ├── api_key.py             # Key creation (plaintext in) & display (masked out)
 │   ├── ai.py                  # Prompt requests, task options, streaming chunks, grounding
 │   ├── conversation.py        # Sessions and messages schemas
-│   ├── reading.py             # History, highlights, bookmarks schemas
+│   ├── reading.py             # History, highlights, stats schemas
 │   ├── quiz.py                # Quiz questions, answer submission, score schemas
 │   ├── sync.py                # Multi-device sync push/pull & conflict schemas (Feature J)
 │   ├── feedback.py            # Response rating & inaccuracy report schemas
@@ -52,7 +52,7 @@ app/
 │   ├── ai_service.py          # Context assembly, prompt engineering, provider delegation
 │   ├── privacy_service.py     # Pre-flight sensitive content inspection & policy checks
 │   ├── conversation_service.py# Chat session & message persistence
-│   ├── reading_service.py     # History, bookmarks, highlights & privacy enforcement
+│   ├── reading_service.py     # History, highlights, stats & privacy enforcement
 │   ├── quiz_service.py        # Comprehension quiz generation & score evaluation
 │   ├── sync_service.py        # Incremental sync & conflict resolution engine
 │   ├── feedback_service.py    # User ratings & reporting management

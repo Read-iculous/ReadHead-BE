@@ -275,8 +275,12 @@ Regression source: `tests/integration/test_account_cache_url_refresh_errors.py`.
 - **Scenario**: `AiStreamRequest.selected_text` was a `PostgresText` (NUL-rejecting) but `page_content` was a plain `str`, so binary/NUL payloads entered prompt assembly and provider calls under `content_type: "pdf_text"`, contradicting the zero-binary ingestion rule.
 - **Fix**: `page_content` now uses the same `PostgresText` annotation. Schema-level rejection is regression-checked in `tests/unit/test_ai_edge_paths.py`.
 
-### [ISSUE-043] Proactive Suggest Calls the Provider on Every Eligible Dwell Event (Open)
+### [ISSUE-043] Proactive Suggest Calls the Provider on Every Eligible Dwell Event (Resolved-in-docs)
 - **Discovered**: 2026-11-28 (BE-11 live verification)
 - **Severity**: Low (observation, no functional bug)
 - **Scenario**: `POST /ai/proactive-suggest` invokes the LLM once per request whenever the user opted in and `dwell_time_seconds` exceeds the sensitivity threshold. A misbehaving extension retry loop can therefore spend user quota quickly; there is no per-conversation dedup or cooldown.
-- **Status**: Open — acceptable for MVP because the endpoint is user-action-driven, but a short TTL cache keyed on `(user_id, paragraph hash)` is recommended before wide rollout.
+- **Status**: Resolved-in-docs (design finalized; implementation pending BE-23). At discovery the behavior was acceptable for MVP because the endpoint is user-action-driven, but a TTL cache was recommended before wide rollout.
+- **Resolution**: The design is now finalized and documented:
+  - The backend adds a Redis TTL cache keyed `(user_id, paragraph_hash)` (SHA-256 of the normalized paragraph text) with a **TTL of 300 seconds (5 minutes)**. A cache hit returns `{has_suggestion: false}` **without calling the LLM**; the key is written only after a successfully generated suggestion, and upstream errors write nothing.
+  - The cache lives only in Redis - never persisted to PostgreSQL, not part of `/sync`, no schema migration, and dedup is skipped silently during Redis degraded mode.
+  - Canonical references: `.docs/api/endpoints.md` Â§5.3 (dedup spec), ADR-017 (decision record), BE-23 (implementation task; acceptance criteria include cache-hit-no-LLM assertions).

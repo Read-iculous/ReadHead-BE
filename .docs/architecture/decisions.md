@@ -46,7 +46,7 @@
 ## ADR-005: Hybrid Client/Server Storage Strategy
 - **Status**: Accepted
 - **Context**: Chrome extensions have access to `chrome.storage.local`, while cross-device sync requires cloud storage.
-- **Decision**: Store durable entities (User profile, encrypted API keys, chat history, highlights, bookmarks, privacy preferences) in PostgreSQL. Store volatile tab state, active DOM extract cache, and in-flight draft text locally in the browser extension.
+- **Decision**: Store durable entities (User profile, encrypted API keys, chat history, highlights, privacy preferences) in PostgreSQL. Store volatile tab state, active DOM extract cache, and in-flight draft text locally in the browser extension.
 - **Consequences**:
   - *Pros*: Minimal database bloat from transient page browsing; seamless synchronization for user value data across different browsers/machines.
 
@@ -186,3 +186,64 @@
   4. **Privacy Mode**: Skip DB writes in Phase 1 and Phase 3 entirely; dispatch `event: done` immediately after LLM finishes streaming.
 - **Consequences**:
   - *Pros*: Zero pool starvation, guaranteed message persistence before client receives success signal, clear error handling on storage failures.
+
+---
+
+## ADR-015: Mandatory Email Verification via Resend, Hashed Tokens & Reset-Driven Revocation
+- **Status**: Accepted (docs complete; NOT implemented — BE-19)
+- **Context**: Password accounts could previously log in immediately after registration, leaving unverified/throwaway email addresses in the user base. Password recovery did not exist, and admins had no way to help users regain access. Transactional email requires a deliverable sending domain and abuse-resistant token handling.
+- **Decision**:
+  1. **Provider**: Send all transactional email (verification, reset, provider-link notifications) through **Resend** via its HTTPS REST API using direct `httpx` calls — matching the project's existing direct-httpx pattern for simple JSON integrations; no dedicated SDK. Configure SPF/DKIM/DMARC for the sending domain.
+  2. **Mandatory verification**: Password registration creates the account with `is_verified = FALSE`, dispatches the verification email fire-and-forget (3 retries with exponential backoff; mail failure NEVER fails registration), and login stays blocked with `403 EMAIL_NOT_VERIFIED` (broadened: password login AND unverified-provider OAuth) until the emailed token is consumed. OAuth (Google/GitHub) accounts are verified by their provider.
+  3. **Tokens hashed-at-rest**: Verification/reset tokens are 256-bit URL-safe CSPRNG values; the database stores only their SHA-256 hex digests (`email_verification_tokens` / `password_reset_tokens`, migration `0004`). Plaintext tokens exist solely inside email links. Single-use (`used_at`), TTL-bounded (24h verification / 60-minute reset), constant-time comparison.
+  4. **Revoke-all-on-reset**: A successful password reset consumes the token and revokes EVERY `auth_sessions` row of the user with reason `security`, reusing the ADR-004/auth-flow §2.5 revocation mechanism; all devices must sign in again.
+  5. **Anti-abuse**: Neutral always-200 forgot/resend responses with stable timing (anti-enumeration), 3/hour per-email resend cap plus the shared auth bucket (email bombing), uniform 401 login failures (credential stuffing), and no token/mail-payload logging (`FR-OPS-03`).
+- **Consequences**:
+  - *Pros*: Verified email as an account-recovery and trust anchor; database leaks yield no usable links; stolen sessions die on password reset; deliverability managed by Resend.
+  - *Cons*: Users must reach their inbox before first login; Resend becomes a soft external dependency (failures degrade to `verification_email_sent: false`, never block registration); DNS records must be maintained.
+
+---
+
+## ADR-016: Backend-Mediated Usage Tracking via Daily Aggregates (Privacy-Compatible)
+- **Status**: Accepted (docs complete; NOT implemented — BE-20)
+- **Context**: Users need visibility into their AI consumption, but per-message usage records would create a content-linked telemetry trail — unacceptable for Privacy Mode — and admin per-user usage views would violate the project's privacy guardrails.
+- **Decision**:
+  1. **Aggregate-only storage**: After each completed generation, upsert-increment one row per `(user_id, date, provider, model)` in `usage_daily` (migration `0005`): `request_count`, `input_tokens`, `output_tokens`. No message IDs, URLs, prompts or response text are recorded, so the aggregate carries zero content linkage.
+  2. **Provider metadata**: Parse the terminal frame of each provider — OpenAI (requires `stream_options.include_usage`), Anthropic (`message_delta`), Gemini (`usageMetadata`). Missing metadata stays `null` in the done event (`total_tokens` remains nullable as today; `input_tokens`/`output_tokens` are added) and stores zeros in the aggregate — never fabricated.
+  3. **Privacy Mode compatibility**: Private-mode generations still increment usage (pure counters, no content rows), unlike conversation/message writes which are skipped entirely.
+  4. **Access**: `GET /users/me/usage?period=day|month&from=&to=` serves the authenticated owner only. Admins see NO per-user usage in the MVP — admin telemetry remains aggregate and content-free. `usage_daily` and api-keys are out of `/sync` scope.
+- **Consequences**:
+  - *Pros*: User-facing consumption transparency with a single bounded table; Privacy Mode contract intact; minimal admin privacy surface.
+  - *Cons*: Streams cancelled before the terminal frame are under-counted (accepted and documented); per-request (sub-daily, per-message) analytics are impossible retroactively.
+
+---
+
+## ADR-017: Personalization Consent & Proactive Dedup (docs complete; NOT implemented — BE-23)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: Personalizing assistance (adapting explanation level/detail to reading proficiency, improving proactive suggestions) requires using `reading_history` and AI interactions. Privacy Mode only stops *new* history writes and does not express consent to *use* existing data for personalization. Separately, ISSUE-043 showed `POST /ai/proactive-suggest` calling the LLM on every eligible dwell event, so a retry loop can burn user quota.
+- **Decision**:
+  1. **Consent column**: `user_settings.personalization_consent BOOLEAN NOT NULL DEFAULT FALSE` (migration `0006`). Opt-in only; default off. **Independent of `privacy_mode_enabled`** — neither flag implies or toggles the other. Revocation sets the flag to `FALSE` and does NOT delete previously stored data (the client prompts the user about existing data). The flag is part of the synchronized `settings` entity, so revocation propagates to all devices, and takes effect immediately.
+  2. **Enforcement rule**: Every current and future code path that uses `reading_history` or AI interactions for personalization MUST re-read `personalization_consent` under the same `users` row lock used by settings updates (the ISSUE-015 stale-snapshot pattern) and skip personalization when it is `FALSE`. Admins see no personalization data or consent-derived views.
+  3. **Purpose bound**: Consent covers exactly: (a) adapting explanation level / answer detail to the user's reading proficiency, and (b) improving proactive suggestions. Any new purpose requires revisiting this ADR.
+  4. **Proactive dedup**: A Redis-only TTL cache keyed `(user_id, paragraph_hash)` (SHA-256 of the normalized paragraph) with TTL 300 seconds (5 minutes). A cache hit returns `{has_suggestion: false}` without any LLM call; the key is written only after a successfully generated suggestion. The cache is never persisted to PostgreSQL, is not part of `/sync`, and degrades silently (dedup skipped) during Redis outages. This closes ISSUE-043 (resolved-in-docs).
+- **Consequences**:
+  - *Pros*: Explicit, auditable consent basis for personalization; users keep their data when revoking; quota-abuse loops cannot multiply proactive LLM calls; zero schema cost for the dedup cache.
+  - *Cons*: A 5-minute window means the same paragraph can trigger one repeated suggestion per window (accepted); consent re-reads add a lock read to personalization paths.
+
+---
+
+## ADR-018: Comprehension Insights — Rule-Based, On-The-Fly Aggregates (docs complete; NOT implemented — BE-24)
+- **Status**: Accepted (docs complete; NOT implemented)
+- **Context**: The product wants a second-tier "Comprehension Insight" (Tầng 2) that tells users which domains they struggle with and lets proactive assistance adapt accordingly. A dedicated insight table or an ML pipeline would add schema, retention and privacy costs disproportionate to an MVP, and `messages` lacks a `task` column to attribute assistance requests precisely.
+- **Decision**:
+  1. **On-the-fly aggregation, no new tables, no ML**: Insights are computed per `(user, domain)` at request time from `quiz_records` (quiz scores/trend) and `messages`⋈`conversations` (user-turn assistance frequency). `reading_history` dwell time is only a secondary corroborating signal — it never raises the difficulty signal alone (false-positive guard). Deleting the underlying data resets signals automatically because nothing is cached or materialized.
+  2. **Access**: `GET /users/me/reading-insights?from&to` (endpoints §3.8) returns per-domain `{avg_quiz_score, quiz_trend, assist_request_rate, difficulty_signal, sample_size, has_sufficient_data}`. All thresholds (quiz windows, 0.6 decay floor, normalized turn ratios, `has_sufficient_data` minima of 2 submitted quizzes / 3 user turns) are configuration constants/env values, not hard-coded logic. Rate bucket: general API bucket.
+  3. **Consent gate (ADR-017 boundary)**: *Viewing* one's own insight requires NO consent (it is the user's own data). *Using* the insight to modulate AI behavior — the optional `insight` field on `POST /ai/proactive-suggest` (§5.3) — requires `personalization_consent == true`, re-read under the user row lock at the point of use (ADR-017 enforcement rule).
+  4. **Anti-spam (layer 3)**: Insight-driven proactive enrichment is capped at **2 per day per domain** via a Redis counter with a 24h TTL; a dismissal of this suggestion type caches a 24h suppression for that `(user, domain)`. Both are Redis-only (degraded mode skips them), never persisted, and never part of `/sync`. When the cap is reached the ordinary hint still works under the existing 5-minute dedup cache.
+  5. **Privacy Mode**: While enabled, no new signals are written; aggregates read only previously stored rows.
+- **Limitations (explicit)**:
+  - `messages` lacks a `task` column, so `assist_request_rate` proxies assistance requests with **user-turn counts** per domain. Adding a `task` column is deferred to a future migration (would then require re-baselining the normalization).
+  - Dwell/reading time is not normalized by word count, so raw dwell is deliberately restricted to a weak secondary signal pending the BC-08 KPI work.
+- **Consequences**:
+  - *Pros*: Zero schema cost (no new table, migration `0007` only drops the unused bookmark column); deterministic and auditable rules; instant reset on data deletion; consent/privacy boundaries reuse ADR-017 mechanisms unchanged.
+  - *Cons*: Rule-based signals are coarser than ML models and cannot retro-analyze before data existed; user-turn proxy over-counts multi-turn chats per domain; thresholds need tuning via configuration as real usage lands.

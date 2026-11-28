@@ -114,7 +114,6 @@ erDiagram
         string page_title
         text cached_summary
         integer reading_time_seconds
-        boolean is_bookmarked
         datetime visited_at
     }
 

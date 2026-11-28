@@ -15,6 +15,14 @@ Updated: 2026-11-21. Implementation status is separate from test/production read
 | BE-16 | `app/services/sync_service.py` | Unified cursor and atomic push implemented; full/incremental pull happy path checked; races/retention/error verification pending |
 | BE-17 | Automated integration/error suite and coverage | Focused regressions, real-Redis middleware test, and opt-in Chrome Swagger/PostgreSQL journey pass; full integration/error suite and coverage targets remain incomplete |
 | BE-18 | `app/services/admin_service.py`, `app/core/limiter.py`, `app/core/middleware.py`, admin router/CLI | Real bootstrap, moderation/reactivation, authoritative revocation, filtering, sanitized feedback, telemetry/timeframes, Redis-error paths and in-flight ban checks pass; full load testing pending |
+| BE-19 | — (planned: token models, email service, auth/users/admin router extensions; migration `0004`) | Docs complete; NOT implemented |
+| BE-20 | — (planned: `usage_daily` model/service, provider usage parsing, `GET /users/me/usage`; migration `0005`) | Docs complete; NOT implemented |
+| BE-21 | — (planned: `ui_language`/`target_language` enum validation, `400 UNSUPPORTED_LANGUAGE`, translate prompt behavior; migration `0006` share) | Docs complete; NOT implemented |
+| BE-22 | — (planned: `GET /quiz`, `GET /quiz/stats`, `GET /quiz/{id}`, `quiz_records` columns + indexes; migration `0006`) | Docs complete; NOT implemented |
+| BE-23 | — (planned: proactive TTL dedup cache `(user_id, paragraph_hash)` 300s, `personalization_consent` column + PATCH/sync, ADR-017 enforcement; migration `0006` share) | Docs complete; NOT implemented |
+| BE-24 | — (planned: `GET /reading/history/stats`, `GET /users/me/reading-insights` on-the-fly aggregates, proactive `insight` field with 2/day/domain cap + 24h dismissal cache, ADR-018) | Docs complete; NOT implemented |
+| BE-25 | — (planned: `GET /users/me/export` GDPR JSON bundle, attachment delivery, dedicated 5/min rate limit, 50 MB size warning) | Docs complete; NOT implemented |
+| BE-26 | — (planned: `DELETE /conversations` bulk with streaming skip, `PATCH /conversations/{id}`, `PATCH /reading/highlights/{id}`, 200 highlights/page limit, delete-while-stream `409 CONVERSATION_BUSY`, migration `0007`) | Docs complete; NOT implemented |
 
 ## Checks performed
 
