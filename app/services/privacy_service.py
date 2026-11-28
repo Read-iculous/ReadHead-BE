@@ -9,7 +9,9 @@ from app.core.privacy.pii_detector import inspect
 from app.models.user_setting import UserSetting
 
 
-def enforce(settings: UserSetting, url: str, text: str, bypass: bool = False) -> None:
+def enforce(
+    settings: UserSetting, url: str, text: str, bypass: bool = False, *, audit: bool = True
+) -> None:
     """Inspect all outbound context before a provider sees any user material."""
     if blocked(url, settings.blacklisted_domains):
         raise AppException(
@@ -26,7 +28,7 @@ def enforce(settings: UserSetting, url: str, text: str, bypass: bool = False) ->
             detected_types=types,
             redacted_preview=preview[:300],
         )
-    if types and bypass:
+    if types and bypass and audit:
         logging.getLogger(__name__).info("sensitive_content_override_confirmed")
 
 

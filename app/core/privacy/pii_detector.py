@@ -15,6 +15,9 @@ PATTERNS = {
     "password": re.compile(
         r"(?i)\b(?:password|passwd|secret|api[_-]?key)\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;]{4,}"
     ),
+    "password_phrase": re.compile(
+        r"(?i)\b(?:my|the)\s+(?:password|passwd|passphrase|pin(?:\s+code)?)\s+(?:is|would\s+be)\s+[\x22\x27]?[^\s\x22\x27,;]{4,}"
+    ),
     "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     "national_id": re.compile(r"\b(?:\d{3}-\d{2}-\d{4}|\d{12})\b"),
     "financial_number": re.compile(r"\b(?:\d[ -]?){13,19}\b"),

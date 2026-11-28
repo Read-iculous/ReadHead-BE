@@ -256,3 +256,27 @@ Regression source: `tests/integration/test_account_cache_url_refresh_errors.py`.
   2. **Store/delete resurrection race**: `store()` validates upstream (up to 10 s) before an unconditional UPSERT; a concurrent `DELETE /api-keys/{provider}` could be resurrected by the late commit. Both writers now serialize through a Redis mutex `lock:apikey:{user_id}:{provider}`.
   3. **Rotation abort on corrupt row**: `rotate_keys` aborted the entire migration when a single ciphertext failed decryption. It now logs `vault_rotation_skipped row=... reason=undecryptable`, excludes that row from subsequent batches, and continues; operators still must investigate skipped rows before removing the old key.
 - **Regression**: `tests/unit/test_security_vault.py` covers roundtrip + fresh nonce, bit-flip tamper rejection (`ENCRYPTION_ERROR` without leaking plaintext), wrong version label, duplicate keyring rejection, and rotation migrating only decryptable rows via the CAS predicate.
+
+### [ISSUE-040] PII Detector Missed Natural-Language Secret Phrasings (Fixed)
+- **Discovered**: 2026-11-28 (BE-10 live verification)
+- **Severity**: Low
+- **Scenario**: The `password` pattern only matched `password=`/`password:` key-value forms. Phrasings such as "my password is Hunter2000x" passed `enforce()` undetected and would have been forwarded to the provider while `data_protection_mode` was on.
+- **Fix**: Added a `password_phrase` pattern covering "(my|the) password/passphrase/pin (is|would be) <value>" with the same redaction behaviour. Key-value forms and innocent prose (dates, phone numbers, scientific text) are regression-checked in `tests/unit/test_ai_edge_paths.py`.
+
+### [ISSUE-041] Consent Audit Log Duplicated Per Stream Request (Fixed)
+- **Discovered**: 2026-11-28 (BE-10 live verification)
+- **Severity**: Low
+- **Scenario**: `ai_service` calls `enforce()` twice per stream (pre-check before key load, then re-check after reloading history/settings to close the privacy-flip race). Both calls logged `sensitive_content_override_confirmed`, so one user consent produced two audit lines.
+- **Fix**: The pre-check now passes `audit=False`; only the authoritative re-check (and single-call paths such as quiz/proactive) emit the consent log. Verified live: exactly one JSON log line with request_id + masked user_id per bypassed stream.
+
+### [ISSUE-042] NUL Bytes Survived Ingestion via `page_content` (Fixed)
+- **Discovered**: 2026-11-28 (BE-09 test-gap closure)
+- **Severity**: Low
+- **Scenario**: `AiStreamRequest.selected_text` was a `PostgresText` (NUL-rejecting) but `page_content` was a plain `str`, so binary/NUL payloads entered prompt assembly and provider calls under `content_type: "pdf_text"`, contradicting the zero-binary ingestion rule.
+- **Fix**: `page_content` now uses the same `PostgresText` annotation. Schema-level rejection is regression-checked in `tests/unit/test_ai_edge_paths.py`.
+
+### [ISSUE-043] Proactive Suggest Calls the Provider on Every Eligible Dwell Event (Open)
+- **Discovered**: 2026-11-28 (BE-11 live verification)
+- **Severity**: Low (observation, no functional bug)
+- **Scenario**: `POST /ai/proactive-suggest` invokes the LLM once per request whenever the user opted in and `dwell_time_seconds` exceeds the sensitivity threshold. A misbehaving extension retry loop can therefore spend user quota quickly; there is no per-conversation dedup or cooldown.
+- **Status**: Open — acceptable for MVP because the endpoint is user-action-driven, but a short TTL cache keyed on `(user_id, paragraph hash)` is recommended before wide rollout.

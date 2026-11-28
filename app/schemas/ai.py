@@ -25,7 +25,7 @@ class AiStreamRequest(PageSource):
     tab_id: int | None = None
     page_title: PostgresText | None = Field(None, max_length=500)
     selected_text: PostgresText = ""
-    page_content: str = ""
+    page_content: PostgresText = ""
     content_type: Literal["html_article", "pdf_text"] = "html_article"
     user_prompt: PostgresText = ""
     provider: Provider | None = None
